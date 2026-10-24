@@ -45,6 +45,7 @@ app_filters=('--include=/Applications/')
 for app in "${ui_apps[@]}"; do
     app_filters+=("--include=/Applications/$app.app/***")
 done
+app_filters+=('--exclude=/Applications/***')
 # Other omitted asset families are not proven optional for every feature.
 omit=(
     '--exclude=/System/Library/LinguisticData/***'
