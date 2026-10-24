@@ -15,6 +15,9 @@ import mkadt
 
 DRAM_BASE = 0x90000000      # isolated XNU window, free in the herolte DTB
 DRAM_SIZE = 0x20000000      # 512 MiB, ends below TIMA at 0xb1000000
+# --bank2: the second DRAM bank (DTB memory@880000000), 2 GiB with no
+# reserved-memory node in it; needs the bank-aware shim/herolte loader.
+BANK2_BASE, BANK2_SIZE = 0x880000000, 0x80000000
 SOC_BASE = 0x10000000       # arm-io ranges base; child regs are relative
 FB_BASE, FB_WIDTH, FB_HEIGHT = 0xe2a00000, 1440, 2560
 
@@ -34,7 +37,7 @@ def child(node, name):
     raise ValueError(f'missing donor ADT node {name}')
 
 
-def build():
+def build(canvas=(FB_WIDTH, FB_HEIGHT), dram=(DRAM_BASE, DRAM_SIZE)):
     root = mkadt.build(seed=os.urandom(64), qemu=True)
     # The userland is the iPhone X IPSW (iPhone10,3 / D22AP), like the donor:
     # compatible[0] is hw.model/hw.target, model is hw.machine. The donor's
@@ -44,32 +47,44 @@ def build():
              mkadt.cstr('samsung,a5xelte') + mkadt.cstr('samsung,herolte') +
              mkadt.cstr('samsung,exynos8890') + mkadt.cstr('AppleARM'))
     chosen = child(root, 'chosen')
-    set_prop(chosen, 'dram-base', mkadt.u64(DRAM_BASE))
-    set_prop(chosen, 'dram-size', mkadt.u64(DRAM_SIZE))
+    set_prop(chosen, 'dram-base', mkadt.u64(dram[0]))
+    set_prop(chosen, 'dram-size', mkadt.u64(dram[1]))
     set_prop(chosen, 'firmware-version', mkadt.cstr('herolte-entry'))
     set_prop(chosen, 'system-firmware-version', mkadt.cstr('herolte-entry'))
+    # MobileGestalt derives the UDID from these; without them it waits for a
+    # Bluetooth/Wi-Fi driver forever, and LaunchServices never finishes seeding
+    # the app database (SpringBoard stays on the boot logo). Synthetic,
+    # locally administered addresses, not the phone's.
+    for name, last in (('wifi0', 1), ('bluetooth0', 2), ('ethernet0', 3)):
+        set_prop(chosen, f'mac-address-{name}', bytes((0x02, 0x48, 0x45, 0x52, 0x4f, last)))
     cpus = child(root, 'cpus')
     cpu0 = child(cpus, 'cpu0')
-    # S-Boot starts on the Cortex-A53 "Apollo" cluster: MPIDR 0x100..0x103.
-    # The Mongoose cluster (MPIDR 0..3) is left out until SMP works.
+    # S-Boot starts on the Cortex-A53 "Apollo" cluster: MPIDR 0x100..0x103
+    # (logical 0..3); the Mongoose cluster, MPIDR 0..3, is logical 4..7.
+    # One XNU cluster (homogeneous SMP); separate L2 ids. cpus=4 keeps the
+    # A53s only.
     set_prop(cpu0, 'compatible', mkadt.cstr('arm,cortex-a53') + mkadt.cstr('ARM,v8'))
     set_prop(cpu0, 'reg', mkadt.u32(0x100))
     set_prop(cpu0, 'timebase-frequency', mkadt.u32(26000000))
-    for logical in range(1, 4):
+    for logical in range(1, 8):
+        mongoose = logical >= 4
+        core = logical - 4 if mongoose else logical
         cpus.children.append(mkadt.node(f'cpu{logical}', [
             ('device_type', mkadt.cstr('cpu')),
-            ('compatible', mkadt.cstr('arm,cortex-a53') + mkadt.cstr('ARM,v8')),
-            ('reg', mkadt.u32(0x100 | logical)),
+            # SweetCPU matches IONameMatch 'arm,cortex-a53' (KernelConfigTables).
+            ('compatible', (mkadt.cstr('samsung,mongoose') if mongoose else b'') +
+                           mkadt.cstr('arm,cortex-a53') + mkadt.cstr('ARM,v8')),
+            ('reg', mkadt.u32(core if mongoose else 0x100 | core)),
             ('cpu-id', mkadt.u32(logical)),
             ('cluster-id', mkadt.u32(0)),
             ('cluster-type', mkadt.u32(0)),
             ('die-cluster-id', mkadt.u32(0)),
             ('cluster-core-id', mkadt.u32(logical)),
-            ('l2-cache-id', mkadt.u32(0)),
+            ('l2-cache-id', mkadt.u32(1 if mongoose else 0)),
             ('l3-cache-id', mkadt.u32(0)),
             ('state', mkadt.cstr('stopped')),
             ('timebase-frequency', mkadt.u32(26000000)),
-            ('clock-frequency', mkadt.u32(1586000000)),
+            ('clock-frequency', mkadt.u32(2600000000 if mongoose else 1586000000)),
             ('bus-frequency', mkadt.u32(100000000)),
             ('memory-frequency', mkadt.u32(1794000000)),
             ('peripheral-frequency', mkadt.u32(26000000)),
@@ -94,8 +109,11 @@ def build():
         # in KernelConfigTables.cpp; without it SpringBoard sees no main display.
         ('compatible', mkadt.cstr('samsung,a5xelte-display') +
          mkadt.cstr('samsung,herolte-display')),
-        ('canvas-width', mkadt.u32(FB_WIDTH)),
-        ('canvas-height', mkadt.u32(FB_HEIGHT)),
+        # MobileGestalt's main-screen size: backboardd sizes its surfaces
+        # from it, not from the framebuffer's GetDisplaySize. With
+        # sweetfb_scale=1 it must be the scaled 960x1706 (--canvas).
+        ('canvas-width', mkadt.u32(canvas[0])),
+        ('canvas-height', mkadt.u32(canvas[1])),
     ]))
     root.children = [n for n in root.children if n.prop('name') not in
                      (mkadt.cstr('sweet-fbcon'), mkadt.cstr('sweet-ufs'))]
@@ -118,7 +136,15 @@ def build():
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('output', type=Path)
+    parser.add_argument('--canvas', default=f'{FB_WIDTH}x{FB_HEIGHT}',
+                        help='presented display WxH (960x1706 with sweetfb_scale=1)')
+    parser.add_argument('--bank2', action='store_true',
+                        help='XNU RAM = the second bank instead of the 512 MiB window')
+    parser.add_argument('--bank2-mb', type=int, default=BANK2_SIZE >> 20,
+                        help='MiB of the second bank to use (2048 panics in kmem_range_init)')
     args = parser.parse_args()
-    blob = adt.serialize(build())
+    canvas = tuple(int(v) for v in args.canvas.lower().split('x'))
+    dram = (BANK2_BASE, min(args.bank2_mb << 20, BANK2_SIZE)) if args.bank2 else (DRAM_BASE, DRAM_SIZE)
+    blob = adt.serialize(build(canvas, dram))
     args.output.write_bytes(blob)
     print(f'{args.output}: {len(blob)} bytes')

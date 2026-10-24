@@ -16,6 +16,10 @@
 #define LOG_BASE 0x8ffff000UL
 #define RAM_BASE 0x90000000UL
 #define RAM_END  0xb0000000UL
+/* Second DRAM bank (DTB memory@880000000, 2 GiB): no reserved-memory node
+ * in it, so XNU may own all of it (mkadt_herolte.py --bank2). */
+#define BANK2_BASE 0x880000000UL
+#define BANK2_END  0x900000000UL
 #define DRAM_LOW 0x80000000UL
 #define PAGE_SIZE 4096UL
 #define BOOT_LINE_LENGTH 608
@@ -148,10 +152,15 @@ uintptr_t hero_prepare_xnu(uintptr_t fdt, volatile uint64_t *log, uint64_t el, u
         __builtin_offsetof(struct payload, segs) + p->nsegs * sizeof(struct payload_seg) > length ||
         p->adt_off > length || p->adt_size > length - p->adt_off)
         return fail(log, -2, "BAD SWEETXNU PAYLOAD");
-    if (p->phys_base < RAM_BASE || p->phys_base >= RAM_END ||
-        !p->mem_size || p->mem_size > RAM_END - p->phys_base ||
+    /* The payload itself sits below RAM_BASE, outside both windows. */
+    uint64_t window_end = p->phys_base >= BANK2_BASE ? BANK2_END : RAM_END;
+    int in_low = p->phys_base >= RAM_BASE && p->phys_base < RAM_END;
+    int in_bank2 = p->phys_base >= BANK2_BASE && p->phys_base < BANK2_END;
+    if (!(in_low || in_bank2) ||
+        !p->mem_size || p->mem_size > window_end - p->phys_base ||
         p->entry_va < p->virt_base || p->kernel_end < p->virt_base)
         return fail(log, -3, "PAYLOAD RAM OUTSIDE WINDOW");
+    hero_fb_hex(2, "RAM BASE", p->phys_base);
     log[13] = p->phys_base;
     log[14] = p->mem_size;
     uintptr_t memory_end = p->phys_base + p->mem_size;

@@ -222,4 +222,44 @@ pantalla y comportamiento de iOS. Plan y mapa de hardware en
 - `0217`: reintentos de lectura como `sec_ts_i2c_read()` (hasta 10),
   contadores `moves/i2c_retries/lost_reads`; las pausas de 11 s solo con
   `herotouchslow=1` (el táctil queda listo a los pocos segundos).
+- **0217 en el teléfono:** `moves=835 i2c_retries=6 lost_reads=0`: los
+  movimientos llegan completos; el gesto en "Hola" no avanza porque Setup
+  espera CoreTelephony/activación (igual que el donor).
+- **🏠 Pantalla de inicio de iOS (2026-10-23):** imagen con Setup marcado
+  como completo (imagen `035edb65…d60a`, flasheo diferencial de 155
+  bloques): pantalla de inicio y Centro de control con el táctil. Sin apps
+  (el staging excluía `/Applications`; dos iconos "Waiting…") y muy lento.
+- `STAGE_ALL_APPS=1` en `ios-root` (todas las apps, ~215 MiB) y `0218` +
+  ADT `cpu4..7`: los 4 Mongoose (MPIDR `0x0..0x3`) como lógicos 4–7 con
+  `cpus=8`.
+- **8 núcleos (ADT con `arm,cortex-a53` también en los Mongoose):**
+  `8/8 CPUs initialized`; `0219` confirma contador común a los dos clusters
+  (lag < 1 ms) y temporizadores que despiertan en los 8 (21 ms sobre 20).
+  Los Mongoose reportan `midr=0x531f0011`, `ctr=0x84448005` (línea de
+  I-cache de 128 B frente a 64 B en los A53).
+- Con todas las apps se quedaba en el logo: `lsd` no terminaba de sembrar la
+  base de LaunchServices porque MobileGestalt calculaba el UDID y esperaba
+  para siempre `mac-address-bluetooth0` (no estaba en `/chosen`). Con MACs
+  sintéticas en el ADT (`02:48:45:52:4f:0x`): **pantalla de inicio con
+  iconos** (Fotos, App Store, Ajustes, Teléfono, Safari, Mensajes) y
+  Ajustes > Información abre ("iPhone X", iOS 16.7.16, 21 GB).
+- **Batería (0220/0221):** el fuel gauge es el del MAX77854 (`0x36` en
+  HSI2C_1 `0x13650000`, pines GPD1-2/3; en HSI2C_0 no hay ACK). Lecturas
+  reales en el teléfono: 100 %, 4339 mV, +114 mA con cargador; 4043 mV,
+  −749 mA sin él; FULLCAP ≈ 2000 mAh. iOS muestra 100 % → 99 %.
+- **Botón de encendido (0220):** con `a5fb_keep_on` se acepta el apagado de
+  pantalla si llega < 3 s después de pulsar Power; bloquea y apaga la
+  pantalla, y vuelve con la pantalla de bloqueo.
+- `0222`: `sweetfb_scale=1` experimental, iOS dibuja 960x1706 y el kernel
+  escala x1.5 (menos píxeles para el renderizado por CPU).
+- **Más RAM (2026-10-23):** el segundo banco de DRAM (`0x880000000`,
+  2 GiB, sin `reserved-memory`) para XNU con `mkadt_herolte.py --bank2`.
+  Con 2 GiB el kernel ve la memoria pero entra en pánico en
+  `kmem_range_init` (no entran sus rangos virtuales). Con
+  `--bank2-mb 1024` arranca; los secundarios no llegaban (CPU_ON rc=0 con
+  entrada > 4 GiB) y `0223` entra por un trampolín en `0x8fffe000`:
+  **1 GiB y 8/8 núcleos**, pantalla de inicio "bastante más fluida, abre
+  todo mucho más rápido".
+- `sweetfb_scale=1` (0222) muestra la imagen rayada y duplicada (las
+  superficies a 960x1706 tienen otro formato): queda desactivado.
 - Pendiente: nodo `/product` del ADT a partir del IPSW; root (UFS).
