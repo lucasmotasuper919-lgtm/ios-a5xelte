@@ -141,7 +141,8 @@ if __name__ == '__main__':
     parser.add_argument('--bank2', action='store_true',
                         help='XNU RAM = the second bank instead of the 512 MiB window')
     parser.add_argument('--bank2-mb', type=int, default=BANK2_SIZE >> 20,
-                        help='MiB of the second bank to use (2048 panics in kmem_range_init)')
+                        help='MiB of the second bank to use; 1536 boots (with boot-arg '
+                             'vm_compression_limit=98304), 2048 panics in write_pte_fast')
     args = parser.parse_args()
     canvas = tuple(int(v) for v in args.canvas.lower().split('x'))
     dram = (BANK2_BASE, min(args.bank2_mb << 20, BANK2_SIZE)) if args.bank2 else (DRAM_BASE, DRAM_SIZE)

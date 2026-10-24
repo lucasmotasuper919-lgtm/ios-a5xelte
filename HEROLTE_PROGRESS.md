@@ -260,6 +260,54 @@ pantalla y comportamiento de iOS. Plan y mapa de hardware en
   entrada > 4 GiB) y `0223` entra por un trampolín en `0x8fffe000`:
   **1 GiB y 8/8 núcleos**, pantalla de inicio "bastante más fluida, abre
   todo mucho más rápido".
+- **0224:** copia a pantalla en paralelo (3 hilos ayudantes): de 10–20 ms a
+  ~5 ms por cuadro, hasta 16 fps con movimiento. El log de `kmem` mostró
+  por qué 2 GiB no entraba: el kernel (configuración macOS) reserva un
+  compresor de 16 × RAM; `vm_compression_limit` lo limita. Con 2 GiB pasa
+  ese punto pero entra en pánico en `write_pte_fast` (PTE no alineada,
+  páginas de 16 KiB sobre 4 KiB). **Configuración actual: `--bank2
+  --bank2-mb 1536`, `vm_compression_limit=98304`, `cpus=8`: 1.5 GiB,
+  arranca.**
+- **GPU Mali-T880 (0225/0226):** el dominio G3D y los relojes ya vienen
+  encendidos de S-Boot; `GPU_ID=0x08802000` (Mali-T880 r2p0), 12 shader
+  cores (`0xff0f`), 1 tiler, 1 L2. Con `herogpu=3`: L2, shader core 0 y
+  tiler encendidos (ready `0x1`) y **primer trabajo en la GPU**:
+  `WRITE_VALUE` en JS1/AS0 con `irq=0x2 mmu=0 exception=1 output=0`, sin
+  fallos y sin afectar a iOS.
+- **🎨 La GPU dibuja (0227–0230, 2026-10-24):** el descriptor simple de la
+  T720 (SFBD) da `DATA_INVALID_FAULT`; con el multi-target de Mesa v5
+  (MFBD) y el tiler "desactivado con jerarquía" (máscara 4096, cabecera de
+  512 bytes) el fragment job escribe **256/256 píxeles** en memoria
+  privada, y con `herogpu=6` **pinta toda la pantalla 1440x2560 de verde
+  en 16.6 ms con un solo shader core** (foto del usuario). La copia de iOS
+  se pausa 8 s (`sweet_fb_hold_until`) para que se vea.
+- **0231:** los **12 shader cores** (`0xff0f`) encienden con la tensión de
+  S-Boot y pintan la pantalla entera en **3.26 ms** (5× más que un núcleo),
+  estable. `COHERENCY_FEATURES=0`: la GPU no ve las cachés de la CPU, así
+  que leer una superficie de iOS exige limpiarla antes (3.8 ms, un núcleo).
+  La copia por "preload" del render target da `DATA_INVALID_FAULT`; Mesa
+  no usa preload en Midgard (copia con un fragment shader). Copiar con la
+  GPU frames dibujados por la CPU no compensa: la aceleración real pasa
+  por shaders (primero un triángulo) y, a la larga, por traducir lo que
+  pide CoreAnimation/Metal.
+- **0232/0233: primer dibujo 3D, un triángulo con shader** (foto del
+  usuario). Un tiler job (JS1) guarda el triángulo en la lista de
+  polígonos (cabecera 32 palabras, cuerpo 48) y un fragment job (JS0)
+  limpia la pantalla y ejecuta un shader Midgard de un bundle, ensamblado
+  a mano (`tools/herolte-midgard-shader.py`). Todo en 16 ms. En 0232 no
+  se veía nada porque el alpha test fijo de Midgard quedó en NEVER; con
+  ALWAYS (0233) el triángulo aparece. Sale casi negro (`02020202`): el
+  shader escribe r0 como fp32, y las constantes fp16 1.0 se leen como
+  ~0.008. Siguiente: texturas → escalado por GPU (iOS a 720p).
+- **0234: primera textura, escalado por GPU** (`herogpu=9`, foto del
+  usuario). Una imagen de 180x320 se dibuja como un quad de pantalla
+  completa con filtro bilineal: la GPU la agranda 8x a 1440x2560. Sin
+  vertex shader, como el preload de Mesa: un varying con coordenadas de
+  texel sin normalizar. Shader de 4 bundles ensamblado a mano (ld_vary,
+  imov a r28, textura, writeout). Los píxeles leídos coinciden con sus
+  texels, y en el borde de un cuadro sale la mezcla del filtro.
+  **3.26 ms con los 12 cores** (34 ms con uno). Siguiente: que iOS
+  dibuje a 720x1280 y la GPU escale cada frame a la pantalla.
 - `sweetfb_scale=1` (0222) muestra la imagen rayada y duplicada (las
   superficies a 960x1706 tienen otro formato): queda desactivado.
 - Pendiente: nodo `/product` del ADT a partir del IPSW; root (UFS).
