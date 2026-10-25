@@ -35,16 +35,32 @@ a **private** repository of your own (step 2).
 cd shim/herolte && CROSS=aarch64-none-elf- sh build.sh && cd ../..
 
 # Apple device tree with the S7 hardware and the iPhone X /product node
-python3 tools/mkadt_herolte.py herolte.adt
+# (1 GiB of the second DRAM bank; needs research/ipsw-x/d22ap.adt)
+python3 tools/mkadt_herolte.py herolte.adt --bank2 --bank2-mb 1024
 
-# Kernel + ADT + boot arguments
+# Kernel + ADT + boot arguments (8 cores, native 1440x2560)
 python3 tools/mkpayload.py kernel.development.herolte herolte.adt payload.bin \
-  --cmdline "debug=0xc serial=3 cpus=4 keepsyms=1 -enable_kprintf_spam -noprogress \
+  --cmdline "debug=0xc serial=3 cpus=8 keepsyms=1 -enable_kprintf_spam -noprogress \
 rd=ufsroot0 ufsroot=USERDATA ufsrw=1 rootrw=1 cs_enforcement_disable=1 \
 unentitled_ios_sim_launch=1 ignition_level=1 launchd_unsecure_cache=1 \
 wdt=-1 -wdt_no_pmu wdt_test=no_user_checkin \
 a5fb_keep_on=1 a5fb_noconsole=1 a5fb_perf=1 sweetfb_native=1"
 ```
+
+**Experimental: GPU display mode.** iOS draws an iPhone XR screen
+(828×1792 @2x, 2.5× fewer pixels) and the Mali scales every frame to the
+panel, with thin black bars at the sides. Build the device tree with
+`--scale2` and add the GPU options to the same command line:
+
+```sh
+python3 tools/mkadt_herolte.py herolte-xr.adt --bank2 --bank2-mb 1024 --scale2
+# append to --cmdline:
+#   sweetfb_scale=1 sweetfb_lw=828 sweetfb_lh=1792 sweetfb_gpu=1 herogpu=1
+```
+
+`herogpu=3`…`9` instead run the GPU bring-up tests about a minute after
+boot (a triangle, a scaled test image, …; see `bsd/dev/herolte_gpu.c`);
+do not combine them with `sweetfb_gpu=1`.
 
 In TWRP, save your current BOOT first (keep it: it is your way back to
 Android):

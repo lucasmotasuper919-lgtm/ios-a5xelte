@@ -308,6 +308,21 @@ pantalla y comportamiento de iOS. Plan y mapa de hardware en
   texels, y en el borde de un cuadro sale la mezcla del filtro.
   **3.26 ms con los 12 cores** (34 ms con uno). Siguiente: que iOS
   dibuje a 720x1280 y la GPU escale cada frame a la pantalla.
+- **0235: iOS en pantalla a través de la GPU** (`sweetfb_scale=1
+  sweetfb_gpu=1`). Cada frame de iOS es la textura del quad de 0234:
+  ~4.4 ms por frame con la limpieza de caché, sin fallos. Más fluido, pero
+  el cuello de botella es CoreAnimation dibujando en la CPU (3-11 fps según
+  la pantalla). 960x1706 son 320 puntos @3x, más angosto que cualquier
+  iPhone de iOS 16: la interfaz se rompe. 1125x2001 (0236) tampoco sirve:
+  UIKit elige la barra de estado por ancho en píxeles y notch.
+- **0237:** como syncmodz/ios-s9, el ADT describe un iPhone XR entero
+  (`--scale2`: 828x1792 @2x, subtype 1792). La GPU lo dibuja a alto
+  completo con barras negras a los lados; el touch se normaliza sobre esa
+  franja. Pendiente de probar.
+- **0238 (de ios-s9):** los hilos de UI y render van a los Mongoose
+  (cpus 4-7) en vez de los A53, y AppleKeyStore responde wrap/unwrap
+  (securityd reintentaba sin fin y cada llamada iba al log). Pendiente de
+  probar.
 - `sweetfb_scale=1` (0222) muestra la imagen rayada y duplicada (las
   superficies a 960x1706 tienen otro formato): queda desactivado.
 - Pendiente: nodo `/product` del ADT a partir del IPSW; root (UFS).

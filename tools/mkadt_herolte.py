@@ -37,8 +37,21 @@ def child(node, name):
     raise ValueError(f'missing donor ADT node {name}')
 
 
-def build(canvas=(FB_WIDTH, FB_HEIGHT), dram=(DRAM_BASE, DRAM_SIZE)):
+def build(canvas=(FB_WIDTH, FB_HEIGHT), dram=(DRAM_BASE, DRAM_SIZE), scale=3):
     root = mkadt.build(seed=os.urandom(64), qemu=True)
+    if scale == 2:
+        # --scale2 (as syncmodz/ios-s9): a whole iPhone XR screen, 414x896
+        # points at @2x (828x1792), 2.5x fewer pixels than the panel for
+        # CoreAnimation's CPU renderer. UIKit picks the status bar layout by
+        # native pixel width and notch, and the notch comes from points,
+        # scale and artwork-device-subtype; any other @2x size gets the red
+        # rdar:45025538 bar. The kernel scales it to the panel
+        # (sweetfb_scale=1 sweetfb_lw=828 sweetfb_lh=1792 sweetfb_gpu=1).
+        set_prop(child(root, 'chosen'), 'display-scale', mkadt.u32(2))
+        product = child(root, 'product')
+        set_prop(product, 'artwork-device-subtype', mkadt.u32(1792))
+        set_prop(product, 'artwork-scale-factor', mkadt.u32(2))
+        canvas = (828, 1792)
     # The userland is the iPhone X IPSW (iPhone10,3 / D22AP), like the donor:
     # compatible[0] is hw.model/hw.target, model is hw.machine. The donor's
     # /buttons stays (home-button-type 2: gesture navigation, no Home key).
@@ -143,9 +156,11 @@ if __name__ == '__main__':
     parser.add_argument('--bank2-mb', type=int, default=BANK2_SIZE >> 20,
                         help='MiB of the second bank to use; 1536 boots (with boot-arg '
                              'vm_compression_limit=98304), 2048 panics in write_pte_fast')
+    parser.add_argument('--scale2', action='store_true',
+                        help='iPhone XR screen, 828x1792 @2x (needs research/ipsw-x/d22ap.adt)')
     args = parser.parse_args()
     canvas = tuple(int(v) for v in args.canvas.lower().split('x'))
     dram = (BANK2_BASE, min(args.bank2_mb << 20, BANK2_SIZE)) if args.bank2 else (DRAM_BASE, DRAM_SIZE)
-    blob = adt.serialize(build(canvas, dram))
+    blob = adt.serialize(build(canvas, dram, 2 if args.scale2 else 3))
     args.output.write_bytes(blob)
     print(f'{args.output}: {len(blob)} bytes')
