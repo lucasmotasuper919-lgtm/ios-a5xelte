@@ -122,7 +122,43 @@ static double render(CARenderer *r, CALayer *root, int W, int H, int frames, voi
     return total / frames;
 }
 
+// Galaxy S7 port: where a crash happened, since the phone keeps no crash report we can read (hero-run puts
+// stdout/stderr into the kernel log). Not async-signal-safe; the process is going away anyway.
+#include <signal.h>
+#include <execinfo.h>
+#include <sys/ucontext.h>
+static void where(const char *what, uintptr_t a) {
+    Dl_info di;
+    if (dladdr((void *)a, &di) && di.dli_fname)
+        fprintf(stderr, "CRASH   %s 0x%lx = %s+0x%lx (%s)\n", what, (unsigned long)a, strrchr(di.dli_fname, '/') ? strrchr(di.dli_fname, '/') + 1 : di.dli_fname,
+                (unsigned long)(a - (uintptr_t)di.dli_fbase), di.dli_sname ? di.dli_sname : "?");
+    else
+        fprintf(stderr, "CRASH   %s 0x%lx\n", what, (unsigned long)a);
+}
+static void on_crash(int sig, siginfo_t *si, void *uc) {
+    _STRUCT_MCONTEXT64 *mc = ((ucontext_t *)uc)->uc_mcontext;
+    fprintf(stderr, "CRASH signal %d at address %p\n", sig, si->si_addr);
+    where("pc", (uintptr_t)mc->__ss.__pc);
+    where("lr", (uintptr_t)mc->__ss.__lr);
+    for (int i = 0; i < 4; i++) fprintf(stderr, "CRASH   x%d=0x%llx\n", i, mc->__ss.__x[i]);
+    uintptr_t fp = (uintptr_t)mc->__ss.__fp;
+    for (int i = 0; i < 16 && fp; i++) {        // frame-pointer walk
+        uintptr_t *f = (uintptr_t *)fp;
+        where("frame", f[1]);
+        fp = f[0];
+    }
+    signal(sig, SIG_DFL);
+    raise(sig);
+}
+
 int main(void) {
+    setvbuf(stdout, NULL, _IONBF, 0);
+    struct sigaction sa = { .sa_sigaction = on_crash, .sa_flags = SA_SIGINFO };
+    sigaction(SIGSEGV, &sa, NULL);
+    sigaction(SIGBUS, &sa, NULL);
+    sigaction(SIGILL, &sa, NULL);
+    sigaction(SIGTRAP, &sa, NULL);
+    sigaction(SIGABRT, &sa, NULL);
     @autoreleasepool {
         const char *inj = getenv("EAGL_INJECT_LIB");       // injection build of the shim: patches the real EAGL classes at load
         if (inj && !(g_shim = dlopen(inj, RTLD_NOW))) { printf("FAIL  dlopen %s: %s\n", inj, dlerror()); return 1; }
