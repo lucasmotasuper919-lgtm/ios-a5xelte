@@ -11,6 +11,7 @@ on:
     branches: [herolte]
     paths:
       - "gpu/mesa/**"
+      - "gpu/eagl/**"
       - ".github/workflows/mesa-ios.yml"
 
 jobs:
@@ -30,7 +31,8 @@ jobs:
         run: |
           set -o pipefail
           bash gpu/mesa/build-mesa.sh "$RUNNER_TEMP/mesa-work" out 2>&1 | tee build.log
-          shasum -a 256 out/osmesa-test out/lib/* | tee out/SHA256SUMS
+          MESA_INC="$RUNNER_TEMP/mesa-work/mesa/include" bash gpu/eagl/build-eagl.sh out 2>&1 | tee -a build.log
+          shasum -a 256 out/osmesa-test out/eagl_ca_test out/hero-run out/lib/* | tee out/SHA256SUMS
       # Logs need a GitHub sign-in to read; check-run annotations are public.
       - name: Report build errors as annotations
         if: failure()
