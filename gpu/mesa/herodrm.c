@@ -238,6 +238,69 @@ free_bo(uint32_t handle)
    return 0;
 }
 
+/* CPU address of GPU VA va (mapping the BO if needed), or NULL. */
+static const uint8_t *
+gpu_to_cpu(uint64_t va, uint64_t len)
+{
+   for (unsigned h = 1; h <= MAX_BOS; h++) {
+      struct hbo *bo = &bos[h];
+      if (!bo->va || va < bo->va || va + len > bo->va + bo->size)
+         continue;
+      if (!bo->cpu) {
+         uint64_t in = h, out = 0;
+         if (call(SEL_MAP, &in, 1, &out, 1) == 0)
+            bo->cpu = out;
+      }
+      return bo->cpu ? (const uint8_t *)(uintptr_t)(bo->cpu + (va - bo->va)) : NULL;
+   }
+   return NULL;
+}
+
+static void
+dump_words(const char *what, uint64_t va, unsigned words)
+{
+   const uint32_t *p = (const uint32_t *)gpu_to_cpu(va, words * 4);
+   if (!p) {
+      herodrm_log("  %s 0x%llx: not in any BO", what, (unsigned long long)va);
+      return;
+   }
+   for (unsigned i = 0; i < words; i += 8)
+      herodrm_log("  %s 0x%llx: %08x %08x %08x %08x %08x %08x %08x %08x", what,
+                  (unsigned long long)(va + i * 4), p[i], p[i + 1], p[i + 2], p[i + 3],
+                  p[i + 4], p[i + 5], p[i + 6], p[i + 7]);
+}
+
+/* After a fault: every job of the chain, and the payload and fault pointer
+ * of the ones that did not finish. Called with the lock held. */
+static void
+dump_chain(uint64_t jc)
+{
+   static const char *types[] = { "?", "null", "write_value", "cache_flush", "compute",
+                                  "vertex", "geometry", "tiler", "fused", "fragment" };
+   for (unsigned n = 0; jc && n < 16; n++) {
+      const uint8_t *h = gpu_to_cpu(jc, 32);
+      if (!h) {
+         herodrm_log("  job 0x%llx: not in any BO", (unsigned long long)jc);
+         return;
+      }
+      uint32_t status = *(const uint32_t *)h;
+      uint64_t fault = *(const uint64_t *)(h + 8), next = *(const uint64_t *)(h + 24);
+      unsigned type = (h[16] >> 1) & 0x7f;
+      herodrm_log("  job 0x%llx %s: status 0x%x first_incomplete %u fault_ptr 0x%llx "
+                  "index %u deps %u,%u next 0x%llx",
+                  (unsigned long long)jc, type < 10 ? types[type] : "?", status,
+                  *(const uint32_t *)(h + 4), (unsigned long long)fault,
+                  *(const uint16_t *)(h + 18), *(const uint16_t *)(h + 20),
+                  *(const uint16_t *)(h + 22), (unsigned long long)next);
+      if (status != 1) {        /* not DONE */
+         dump_words("payload", jc + 32, 48);
+         if (fault)
+            dump_words("at fault_ptr", fault & ~31ull, 16);
+      }
+      jc = h[16] & 1 ? next : (uint32_t)*(const uint32_t *)(h + 24);
+   }
+}
+
 static int
 submit(struct drm_panfrost_submit *s)
 {
@@ -251,6 +314,8 @@ submit(struct drm_panfrost_submit *s)
                      (unsigned long long)submits, (unsigned long long)s->jc,
                      (unsigned long long)in[1], kr, (unsigned long long)out[0],
                      (unsigned long long)out[1]);
+      if (faults <= 2)
+         dump_chain(s->jc);
    } else {
       DBG("SUBMIT #%llu jc 0x%llx js %llu: %llu us", (unsigned long long)submits,
           (unsigned long long)s->jc, (unsigned long long)in[1], (unsigned long long)out[1]);
