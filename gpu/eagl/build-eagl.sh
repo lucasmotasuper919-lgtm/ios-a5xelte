@@ -21,11 +21,11 @@ OBJ=$(mktemp -d)
 python3 "$HERE/tools/gen_gl_stubs.py" > "$OBJ/gl_stubs.c"
 CF="-O2 -g -fvisibility=hidden -Wall -Wno-deprecated-declarations -Wno-unused-function -I$HERE/src -I$MESA_INC"
 $CC $CF -c "$OBJ/gl_stubs.c" -o "$OBJ/gl_stubs.o"
-for f in gl_resolve gl_unimpl osm macro_ctx macro_slots; do
+for f in gl_resolve gl_unimpl osm macro_ctx macro_slots hero_log; do
   $CC $CF -c "$HERE/src/$f.c" -o "$OBJ/$f.o"
 done
 $CC $CF -fno-objc-arc -fobjc-exceptions -DEAGL_INJECT -c "$HERE/src/eagl.m" -o "$OBJ/eagl.o"
-$CC -dynamiclib -o "$OUT/lib/libheroeagl.dylib" "$OBJ"/{gl_stubs,gl_resolve,gl_unimpl,osm,macro_ctx,macro_slots,eagl}.o \
+$CC -dynamiclib -o "$OUT/lib/libheroeagl.dylib" "$OBJ"/{gl_stubs,gl_resolve,gl_unimpl,osm,macro_ctx,macro_slots,hero_log,eagl}.o \
   -install_name @rpath/libheroeagl.dylib \
   -framework Foundation -framework CoreFoundation -framework CoreGraphics -framework IOSurface \
   -L "$OUT/lib" -lOSMesa.8 -Wl,-rpath,/private/var/herolte/lib -Wl,-undefined,error
