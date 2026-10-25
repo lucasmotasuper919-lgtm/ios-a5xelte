@@ -214,6 +214,9 @@ create_bo(struct drm_panfrost_create_bo *req)
    }
    req->handle = (uint32_t)out[0];
    req->offset = out[1];
+   /* Mesa takes the BO's size from here (pan_kmod_bo_init): a capped heap
+    * must not be described to the tiler as the size asked for. */
+   req->size = (uint32_t)out[2];
    bos[out[0]] = (struct hbo){ .va = out[1], .size = out[2] };
    DBG("CREATE_BO %u: %llu bytes at 0x%llx flags 0x%x", req->handle,
        (unsigned long long)out[2], (unsigned long long)out[1], req->flags);
