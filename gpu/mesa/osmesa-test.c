@@ -135,11 +135,11 @@ main(void)
       red += r > 200 && g < 40 && b < 40;
       blue += b > 150 && r < 60;
    }
-   /* The triangle covers 1/4 of the frame (16384 pixels). */
+   /* The triangle (base 128 px, height 128 px) covers 8192 pixels. */
    herodrm_log("pixels: center 0x%08x (red 0xff0000ff), corner 0x%08x (blue ~0xffbf4020), "
                "%d red, %d blue of %d -> %s",
                center, corner, red, blue, W * H,
-               red > 15000 && red < 18000 && red + blue == W * H ? "OK" : "WRONG");
+               red > 7900 && red < 8500 && red + blue == W * H ? "OK" : "WRONG");
 
    const int n = 300;
    t0 = now_ms();

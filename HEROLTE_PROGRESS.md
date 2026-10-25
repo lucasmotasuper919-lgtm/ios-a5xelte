@@ -342,6 +342,15 @@ pantalla y comportamiento de iOS. Plan y mapa de hardware en
   (Gallium + compilador Midgard) dentro de OSMesa, compilado para iOS, con
   un libdrm que traduce los ioctl de Panfrost a HeroGPU. `osmesa-test`
   dibuja un triángulo con OpenGL y mide fps; resultado en el log del kernel.
+- **Primer OpenGL en la Mali desde iOS.** `GL_RENDERER = Mali-T880
+  (Panfrost)`, GL 2.1. Hicieron falta dos arreglos: 0243 configura la GPU
+  como Linux para un T880 r2p0 (`SHADER_CONFIG.LS_ALLOW_ATTR_TYPES`,
+  clock gate del tiler, throttle del JM), y el libdrm devuelve a Mesa el
+  tamaño real del heap del tiler (32 MiB, no los 128 pedidos: el tiler
+  escribía sobre otros buffers → DATA_INVALID_FAULT 0x58). Resultado: sin
+  fallos, centro rojo `0xff0000ff`, fondo azul, 8192 píxeles del triángulo
+  exactos; **256x256 a 159 fps** con `glFinish` en cada frame. Siguiente:
+  la capa Metal de Chlorophyll sobre este Panfrost, para CoreAnimation.
 - `sweetfb_scale=1` (0222) muestra la imagen rayada y duplicada (las
   superficies a 960x1706 tienen otro formato): queda desactivado.
 - Pendiente: nodo `/product` del ADT a partir del IPSW; root (UFS).
