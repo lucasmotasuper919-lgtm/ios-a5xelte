@@ -14,3 +14,4 @@ The `macro_slots.c` offsets were derived from iOS 18 (22H352); the same offsets 
 port's iOS 16 OpenGLES.framework (all 457 entry points match). Unlike iOS 18, iOS 16's render server
 still falls back to `CA::OGL::GLESContext` by itself when Metal is unavailable (it creates an
 `EAGLContext` with `initWithAPI:3 properties:`), so Bergamota's QuartzCore hook is not needed here.
+
