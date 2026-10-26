@@ -16,7 +16,8 @@ on:
 
 jobs:
   build:
-    runs-on: macos-14
+    # Intel runners: macos-14 (arm64) jobs went unacquired for hours (Oct 2026); any Xcode cross-builds this.
+    runs-on: macos-15-intel
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
