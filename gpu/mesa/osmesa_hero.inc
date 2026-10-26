@@ -15,8 +15,7 @@
 #include "state_tracker/st_cb_eglimage.h"
 #include "state_tracker/st_cb_flush.h"
 #include "state_tracker/st_cb_texture.h"
-#include "util/os_time.h"
-#include "util/u_box.h"
+#include "util/os_time.h"       /* u_box_2d: util/box.h, already included by osmesa.c */
 
 extern int hero_hw_active(void);
 extern struct pipe_resource *hero_hw_surface_resource(uint32_t surface_id, int opaque, unsigned *w, unsigned *h);
