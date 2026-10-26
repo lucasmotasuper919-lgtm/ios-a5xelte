@@ -993,9 +993,24 @@ static DrawBind *find_bind(struct _EAGLContextPrivate *p, GLuint rb) {
     glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
     glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
     GLenum ifmt = internalFormat == GL_BGRA_EXT ? GL_RGBA : (GLenum)internalFormat;
-    if (g_reupload) glTexSubImage2D((GLenum)target, 0, 0, 0, w, h, bgra8 ? GL_RGBA : (GLenum)format, (GLenum)type, tmp);
+    // Galaxy S7 port: a texture that already holds this surface's size and format is refilled in place (as Topaz/ios-spes'
+    // eagl-attach-gpu.patch does): glTexImage2D would give it new storage, a new GPU buffer the kernel zeroes and maps every time.
+    BOOL same_storage = NO;
+    if (!g_reupload && (GLenum)target == GL_TEXTURE_2D) {
+        GLint bound = 0; glGetIntegerv(GL_TEXTURE_BINDING_2D, &bound);
+        pthread_mutex_lock(&g_live_lock);
+        for (int i = 0; i < g_nlive; i++)
+            if (g_live[i].ctx == self && g_live[i].name == (GLuint)bound && g_live[i].w == w && g_live[i].h == h &&
+                g_live[i].ifmt == (GLenum)internalFormat && g_live[i].fmt == (GLenum)format && g_live[i].type == (GLenum)type) same_storage = YES;
+        pthread_mutex_unlock(&g_live_lock);
+    }
+    if (g_reupload || same_storage) glTexSubImage2D((GLenum)target, 0, 0, 0, w, h, bgra8 ? GL_RGBA : (GLenum)format, (GLenum)type, tmp);
     else glTexImage2D((GLenum)target, 0, ifmt, w, h, 0, bgra8 ? GL_RGBA : (GLenum)format, (GLenum)type, tmp);
     GLenum err = glGetError();
+    if (err != GL_NO_ERROR && same_storage) {           // the client gave the texture other storage since: allocate as before
+        glTexImage2D((GLenum)target, 0, ifmt, w, h, 0, bgra8 ? GL_RGBA : (GLenum)format, (GLenum)type, tmp);
+        err = glGetError();
+    }
     if (err != GL_NO_ERROR) EAGL_DEBUG("  glTexImage2D failed 0x%x (ifmt 0x%lx fmt 0x%lx type 0x%lx)\n", err, (unsigned long)internalFormat, (unsigned long)format, (unsigned long)type);
     // IOSurface textures have no mip chain: make the texture complete with sane defaults (the client overrides them if it cares).
     if (!g_reupload) {
