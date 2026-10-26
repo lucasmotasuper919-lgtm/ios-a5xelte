@@ -321,8 +321,36 @@ pantalla y comportamiento de iOS. Plan y mapa de hardware en
   franja. Pendiente de probar.
 - **0238 (de ios-s9):** los hilos de UI y render van a los Mongoose
   (cpus 4-7) en vez de los A53, y AppleKeyStore responde wrap/unwrap
-  (securityd reintentaba sin fin y cada llamada iba al log). Pendiente de
-  probar.
+  (securityd reintentaba sin fin y cada llamada iba al log). Probado:
+  más fluido, log de AKS de 1600 a 19 líneas. El XR deja barras negras y
+  el Centro de Control sin blur (fondo negro: el blur es de Metal).
+- **0239: HeroGPU, etapa 1 de la aceleración completa.** Servicio IOKit
+  para que procesos de iOS usen la Mali (GetParam con los números de
+  Panfrost, CreateBO/FreeBO/MapBO, Submit). Selftest en el teléfono:
+  `GPU_ID 0x880 rev 0x2000 shaders 0xff0f`, un WRITE_VALUE desde un buffer
+  de usuario en VA 0x40000000 → **OK en 115 µs**. Siguiente: Mesa Panfrost
+  compilado para iOS con un libdrm sobre HeroGPU (como Bergamota con
+  freedreno), luego la capa Metal de Chlorophyll.
+- **0240-0242: programas de iOS en la GPU.** Zona de "drop" en USERDATA
+  (`tools/herolte-drop.py` desde TWRP, el kernel la instala en
+  `/private/var/herolte/` cuando la raíz pasa a lectura-escritura; launchd
+  corre `autorun`). 0242 corrige `pmap_sync_page_attributes_phys`, que
+  truncaba direcciones físicas sobre 4 GiB (panic en MapBO). Probado con
+  `herogpu-test` desde iOS: los parámetros de Panfrost, WRITE_VALUE → OK en
+  358 µs y un FRAGMENT clear de 64x64 → **4096/4096 píxeles OK en 197 µs**.
+- **Etapa 2 (`gpu/mesa`, workflow `mesa-ios`):** Mesa 25.0.7 Panfrost
+  (Gallium + compilador Midgard) dentro de OSMesa, compilado para iOS, con
+  un libdrm que traduce los ioctl de Panfrost a HeroGPU. `osmesa-test`
+  dibuja un triángulo con OpenGL y mide fps; resultado en el log del kernel.
+- **Primer OpenGL en la Mali desde iOS.** `GL_RENDERER = Mali-T880
+  (Panfrost)`, GL 2.1. Hicieron falta dos arreglos: 0243 configura la GPU
+  como Linux para un T880 r2p0 (`SHADER_CONFIG.LS_ALLOW_ATTR_TYPES`,
+  clock gate del tiler, throttle del JM), y el libdrm devuelve a Mesa el
+  tamaño real del heap del tiler (32 MiB, no los 128 pedidos: el tiler
+  escribía sobre otros buffers → DATA_INVALID_FAULT 0x58). Resultado: sin
+  fallos, centro rojo `0xff0000ff`, fondo azul, 8192 píxeles del triángulo
+  exactos; **256x256 a 159 fps** con `glFinish` en cada frame. Siguiente:
+  la capa Metal de Chlorophyll sobre este Panfrost, para CoreAnimation.
 - `sweetfb_scale=1` (0222) muestra la imagen rayada y duplicada (las
   superficies a 960x1706 tienen otro formato): queda desactivado.
 - Pendiente: nodo `/product` del ADT a partir del IPSW; root (UFS).

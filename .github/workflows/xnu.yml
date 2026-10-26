@@ -112,8 +112,14 @@ jobs:
           pat = re.compile(r'(error:|fatal error|Error \d|\*\*\* |FAILED|Skipping patch|No such file|panic|❌)', re.I)
           # Compiler/linker errors first: blacktop's known patch-skip lines
           # come first in the log and used to fill every annotation.
-          cc = re.compile(r'(:\d+:\d+: (fatal )?error:|^ld: |Undefined symbols|clang: error)')
+          # (Not "ld: warning": dtrace's libelf version warnings filled every
+          # annotation and hid the real error, run 47.)
+          cc = re.compile(r'(:\d+:\d+: (fatal )?error:|^ld: (?!warning)|Undefined symbols|clang: error|^make.*Error)')
           hits = [l for l in clean if cc.search(l)]
+          # The lines around each compiler error (annotations hold 4 KiB).
+          for i, l in enumerate(clean):
+              if re.search(r':\d+:\d+: (fatal )?error:', l) and len(hits) < 40:
+                  hits.append('CONTEXT ' + ' | '.join(x[:200] for x in clean[i:i + 4]))
           hits += [l for l in clean if pat.search(l) and l not in hits and 'Skipping patch' not in l
                    and 'already exists in working directory' not in l and 'patch does not apply' not in l]
           esc = lambda s: s.replace('%', '%25').replace('\r', '').replace('\n', '%0A')
