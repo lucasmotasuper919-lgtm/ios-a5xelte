@@ -33,6 +33,27 @@ static void *lookup(const char *n) {
     return p;
 }
 
+// Galaxy S7 port: GL_APPLE_fence and the object waits of GL_APPLE_flush_buffer_range's family, which Mesa does not
+// have. iOS 16's CoreAnimation calls glFinishObjectAPPLE before it deletes a render target; it landed in
+// gl_unimpl. Our submits are synchronous in the kernel, so finishing is a glFinish and every fence is signalled.
+typedef unsigned GLu;
+static void apple_finish(void) { static void (*f)(void); if (!f) f = (void (*)(void))lookup("glFinish"); if (f) f(); }
+static void apple_flush(void) { static void (*f)(void); if (!f) f = (void (*)(void))lookup("glFlush"); if (f) f(); }
+static void gl_FinishObjectAPPLE(GLu object, int name) { (void)object; (void)name; apple_finish(); }
+static unsigned char gl_TestObjectAPPLE(GLu object, GLu name) { (void)object; (void)name; return 1; }
+static void gl_GenFencesAPPLE(int n, GLu *fences) { static GLu next = 1; for (int i = 0; i < n; i++) fences[i] = next++; }
+static void gl_DeleteFencesAPPLE(int n, const GLu *fences) { (void)n; (void)fences; }
+static void gl_SetFenceAPPLE(GLu fence) { (void)fence; apple_flush(); }
+static unsigned char gl_IsFenceAPPLE(GLu fence) { return fence != 0; }
+static unsigned char gl_TestFenceAPPLE(GLu fence) { (void)fence; return 1; }
+static void gl_FinishFenceAPPLE(GLu fence) { (void)fence; apple_finish(); }
+static const struct { const char *name; void *fn; } apple_fns[] = {
+    { "glFinishObjectAPPLE", (void *)gl_FinishObjectAPPLE }, { "glTestObjectAPPLE", (void *)gl_TestObjectAPPLE },
+    { "glGenFencesAPPLE", (void *)gl_GenFencesAPPLE }, { "glDeleteFencesAPPLE", (void *)gl_DeleteFencesAPPLE },
+    { "glSetFenceAPPLE", (void *)gl_SetFenceAPPLE }, { "glIsFenceAPPLE", (void *)gl_IsFenceAPPLE },
+    { "glTestFenceAPPLE", (void *)gl_TestFenceAPPLE }, { "glFinishFenceAPPLE", (void *)gl_FinishFenceAPPLE },
+    { 0, 0 } };
+
 void gl_resolve_all(void) {
     static int done;
     if (done) return;
@@ -42,6 +63,8 @@ void gl_resolve_all(void) {
         void *p = 0;
         for (int k = 0; noop_names[k]; k++)
             if (!strcmp(n, noop_names[k])) p = (void *)gl_noop;
+        for (int k = 0; apple_fns[k].name && !p; k++)
+            if (!strcmp(n, apple_fns[k].name)) p = apple_fns[k].fn;
         if (!p) p = lookup(n);
         if (!p) {
             size_t l = strlen(n);
