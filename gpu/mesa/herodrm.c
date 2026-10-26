@@ -22,6 +22,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <time.h>
 #include <unistd.h>
 
 #include <xf86drm.h>
@@ -64,6 +65,41 @@ static struct hbo bos[MAX_BOS + 1];     /* by kernel handle */
 static struct { int fd; uint32_t handle; } primes[MAX_PRIME];  /* imported surfaces' stand-in descriptors */
 static int debug = -1;
 static uint64_t submits, faults;
+
+/* Where the time goes, logged every 5 s while the GPU is used: submits (GPU
+ * time as the kernel measured it, and the whole call) and BO creation (the
+ * kernel zeroes, cleans and maps every new buffer). */
+static struct {
+   uint64_t start_ns, submits, gpu_us, submit_ns, creates, create_bytes, create_ns, frees;
+} st;
+
+EXPORT void herodrm_log(const char *fmt, ...);
+
+static uint64_t
+now_ns(void)
+{
+   return clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+}
+
+static void
+stats_tick(uint64_t t)
+{
+   if (!st.start_ns) {
+      st.start_ns = t;
+      return;
+   }
+   uint64_t wall = t - st.start_ns;
+   if (wall < 5000000000ull)
+      return;
+   herodrm_log("stats %.1f s: %llu submits, GPU %.1f ms (%.0f%%), submit calls %.1f ms | "
+               "%llu new BOs %.1f MB in %.1f ms | %llu freed",
+               wall / 1e9, (unsigned long long)st.submits, st.gpu_us / 1e3,
+               100.0 * st.gpu_us * 1e3 / wall, st.submit_ns / 1e6,
+               (unsigned long long)st.creates, st.create_bytes / 1048576.0, st.create_ns / 1e6,
+               (unsigned long long)st.frees);
+   memset(&st, 0, sizeof(st));
+   st.start_ns = t;
+}
 
 static uint32_t
 call(uint32_t sel, const uint64_t *in, uint32_t nin, uint64_t *out, uint32_t nout)
@@ -208,7 +244,13 @@ create_bo(struct drm_panfrost_create_bo *req)
    if (req->flags & PANFROST_BO_HEAP && size > heap_cap())
       size = heap_cap();
    uint64_t in = size, out[3] = {0};
+   uint64_t t0 = now_ns();
    uint32_t kr = call(SEL_CREATE, &in, 1, out, 3);
+   uint64_t t1 = now_ns();
+   st.creates++;
+   st.create_bytes += size;
+   st.create_ns += t1 - t0;
+   stats_tick(t1);
    if (kr || out[0] == 0 || out[0] > MAX_BOS) {
       herodrm_log("CREATE_BO %llu bytes (flags 0x%x) failed: 0x%x",
                   (unsigned long long)size, req->flags, kr);
@@ -238,6 +280,7 @@ free_bo(uint32_t handle)
       return fail(EINVAL);
    uint64_t in = handle;
    call(SEL_FREE, &in, 1, NULL, 0);
+   st.frees++;
    memset(&bos[handle], 0, sizeof(bos[handle]));
    for (int i = 0; i < MAX_PRIME; i++)
       if (primes[i].handle == handle) {      /* an imported surface: its stand-in descriptor goes too */
@@ -315,8 +358,14 @@ static int
 submit(struct drm_panfrost_submit *s)
 {
    uint64_t in[2] = { s->jc, (s->requirements & PANFROST_JD_REQ_FS) ? 0 : 1 }, out[2] = {0};
+   uint64_t t0 = now_ns();
    uint32_t kr = call(SEL_SUBMIT, in, 2, out, 2);
+   uint64_t t1 = now_ns();
    submits++;
+   st.submits++;
+   st.gpu_us += out[1];
+   st.submit_ns += t1 - t0;
+   stats_tick(t1);
    if (kr || out[0]) {
       faults++;
       if (faults <= 16 || debug > 0)
