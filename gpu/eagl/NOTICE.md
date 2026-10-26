@@ -16,3 +16,4 @@ still falls back to `CA::OGL::GLESContext` by itself when Metal is unavailable (
 `EAGLContext` with `initWithAPI:3 properties:`), so Bergamota's QuartzCore hook is not needed here.
 
 
+
