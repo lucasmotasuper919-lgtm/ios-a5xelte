@@ -1,0 +1,337 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -111,6 +111,7 @@ bsd/dev/herolte_ufs.c			standard
+ bsd/dev/herolte_touch.c			standard
+ bsd/dev/herolte_battery.c		standard
+ bsd/dev/herolte_gpu.c			standard
++bsd/dev/herolte_wifi.c			standard
+ bsd/dev/a5xelte_keys.c			standard
+ bsd/dev/a5xelte_touch.c			standard
+ bsd/dev/sweet_sample.c			standard
+diff --git a/bsd/dev/herolte_wifi.c b/bsd/dev/herolte_wifi.c
+new file mode 100644
+--- /dev/null
++++ b/bsd/dev/herolte_wifi.c
+@@ -0,0 +1,308 @@
++/*
++ * HEROLTE (Galaxy S7 SM-G930F, Exynos 8890) Wi-Fi, stage 1: bring the BCM4359 C0 up on PCIe0.
++ * Boot-arg herowifi=N, off when absent:
++ *   1  read-only report: PMU PHY isolation, GPJ1 pins, CMU_FSYS1 gates and PHY user muxes.
++ *   2  1 + power: WLAN_EN high, PERST low, PCIe0 aclk/pclk gates, PMU PHY isolation
++ *      released, PHY power-down cleared.
++ *   3  2 + link: PHY tables, resets, PHY clocks, PERST high, LTSSM enable, wait for L0.
++ * Register values come from the stock Samsung kernel (pci-exynos.c, pci-exynos8890_cal.c,
++ * the pwrcal S5E8890 CMU tables and the DTB); this file is an independent implementation.
++ * Not done yet: dw_pcie_setup_rc, endpoint config space (vendor ID), firmware, scan.
++ * ELBI/PHY/PCS are touched only from stage 2 on, after the FSYS1 gates are opened.
++ * Everything runs in a kernel thread, 3 s after boot (root mounted, persistent log running).
++ * The persistent log reaches USERDATA every 10 s, so before each risky write the thread
++ * prints a checkpoint line and waits 11 s: after a hang, `tools/herolte-log-pull.py` in
++ * TWRP still shows the last step. herowifislow=0 skips those waits.
++ */
++#if defined(ARM64_BOARD_CONFIG_HEROLTE)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <kern/clock.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++void herolte_wifi_probe(void);
++
++#define HW_PMU_PA        0x105c0000u
++#define HW_GPIO_PA       0x14cc0000u    /* PERIC1 pin-controller (GPJ1) */
++#define HW_CMU_PA        0x156e0000u    /* CMU_FSYS1 */
++#define HW_PHY_PA        0x15630000u
++#define HW_ELBI_PA       0x15660000u
++#define HW_PCS_PA        0x156f0000u
++#define HW_SYSREG_PA     0x15601000u    /* SYSREG_FSYS1 + 0x1000 */
++
++#define PMU_PCIE_PHY_CTL 0x071cu        /* bit 0: PHY isolation released */
++#define GPJ1             0x060u         /* CON +0x00 (4 bits/pin), DAT +0x04 */
++#define PIN_CLKREQ       0
++#define PIN_PERST        2
++#define PIN_WLAN_EN      3
++
++#define CMU_ACLK_STAT    0x0600u        /* CLK_STAT_MUX_ACLK_FSYS1_200_USER */
++#define CMU_CG_VAL_ACLK  0x0800u        /* bits 16..12: PCLK, DBI, SLV, MSTR, AHB2AXI of PCIe WiFi0 */
++#define CMU_CG_MAN_ACLK  0x1800u
++#define CG_PCIE0_MASK    (0x1fu << 12)
++static const uint32_t cmu_phymux[3]      = { 0x0230, 0x0234, 0x0240 };  /* TX0, RX0, DIG_REFCLK user muxes */
++static const uint32_t cmu_phymux_stat[3] = { 0x0630, 0x0634, 0x0640 };
++
++#define SYSREG_A         0x044u         /* block register (0x15601044) */
++#define SYSREG_B         0x050u         /* block register + 0xC */
++
++#define ELBI_SW_WAKE        0x018u
++#define ELBI_LTSSM_EN       0x02cu
++#define ELBI_L1_BUG_FIX     0x038u
++#define ELBI_LINKUP         0x074u
++#define ELBI_REQ_EXIT_L1    0x0f4u
++#define ELBI_LINKDOWN_SEL   0x1b8u
++#define ELBI_SOFT_CORE_RST  0x1d0u
++#define ELBI_RST_PCS_G      0x288u
++#define ELBI_RST_PCS_CMN    0x28cu
++#define ELBI_RST_MAC_CMN    0x290u
++
++static const uint8_t phy_cmn[26] = {
++	0x01, 0x0F, 0xA6, 0x31, 0x90, 0x62, 0x20, 0x00,
++	0x00, 0xA7, 0x0A, 0x37, 0x20, 0x08, 0xEF, 0xFC,
++	0x96, 0x14, 0x00, 0x10, 0x60, 0x01, 0x00, 0x00,
++	0x04, 0x10
++};
++static const uint8_t phy_trsv[41] = {
++	0x31, 0xF4, 0xF4, 0x80, 0x25, 0x40, 0xD8, 0x03,
++	0x35, 0x55, 0x4C, 0xC3, 0x10, 0x54, 0x70, 0xC5,
++	0x00, 0x2F, 0x38, 0xA4, 0x00, 0x3B, 0x30, 0x9A,
++	0x64, 0x00, 0x1F, 0x83, 0x1B, 0x01, 0xE0, 0x00,
++	0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x1D,
++	0x00
++};
++
++static vm_offset_t pmu, gpio, cmu, phy, elbi, pcs, sysreg;
++
++static uint32_t
++hw_rd(vm_offset_t base, uint32_t off)
++{
++	uint32_t v = *(volatile uint32_t *)(base + off);
++	__asm__ volatile ("dmb oshld" ::: "memory");
++	return v;
++}
++
++static void
++hw_wr(vm_offset_t base, uint32_t off, uint32_t v)
++{
++	__asm__ volatile ("dmb oshst" ::: "memory");
++	*(volatile uint32_t *)(base + off) = v;
++	__asm__ volatile ("dsb osh" ::: "memory");
++}
++
++static int hw_sleep_chan;
++static int hw_stage;
++static int hw_slow = 1;
++
++static void hw_udelay(uint32_t us) { delay_for_interval(us, NSEC_PER_USEC); }
++
++static void
++hw_msleep(unsigned ms)
++{
++	uint64_t deadline;
++	clock_interval_to_deadline(ms, NSEC_PER_MSEC, &deadline);
++	(void)assert_wait_deadline(&hw_sleep_chan, THREAD_UNINT, deadline);
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++/* The persistent log is flushed every 10 s: wait so this line is on disk before the write. */
++static void
++hw_checkpoint(const char *what)
++{
++	printf("HEROLTE WIFI: checkpoint, next: %s\n", what);
++	if (hw_slow) {
++		hw_msleep(11000);
++	}
++}
++
++static void
++hw_pin_level(int pin, int level)
++{
++	uint32_t dat = hw_rd(gpio, GPJ1 + 0x04);
++	dat = level ? (dat | (1u << pin)) : (dat & ~(1u << pin));
++	hw_wr(gpio, GPJ1 + 0x04, dat);
++}
++
++static void
++hw_pin_func(int pin, uint32_t fn)
++{
++	uint32_t con = hw_rd(gpio, GPJ1 + 0x00);
++	con = (con & ~(0xfu << (4 * pin))) | (fn << (4 * pin));
++	hw_wr(gpio, GPJ1 + 0x00, con);
++}
++
++static void
++hw_report(void)
++{
++	uint32_t phyctl = hw_rd(pmu, PMU_PCIE_PHY_CTL);
++	uint32_t con = hw_rd(gpio, GPJ1 + 0x00);
++	uint32_t dat = hw_rd(gpio, GPJ1 + 0x04);
++	printf("HEROLTE WIFI: PMU PCIE_PHY_CONTROL=%#x (PHY isolation %s)\n", phyctl, (phyctl & 1) ? "released" : "on");
++	printf("HEROLTE WIFI: GPJ1 CON=%#x DAT=%#x; clkreq fn %#x lvl %u, perst fn %#x lvl %u, wlan_en fn %#x lvl %u\n",
++	    con, dat,
++	    (con >> (4 * PIN_CLKREQ)) & 0xf, (dat >> PIN_CLKREQ) & 1,
++	    (con >> (4 * PIN_PERST)) & 0xf, (dat >> PIN_PERST) & 1,
++	    (con >> (4 * PIN_WLAN_EN)) & 0xf, (dat >> PIN_WLAN_EN) & 1);
++	printf("HEROLTE WIFI: CMU_FSYS1 aclk_user_stat=%#x cg_val=%#x cg_man=%#x\n",
++	    hw_rd(cmu, CMU_ACLK_STAT), hw_rd(cmu, CMU_CG_VAL_ACLK), hw_rd(cmu, CMU_CG_MAN_ACLK));
++	printf("HEROLTE WIFI: PHY user muxes tx0=%#x rx0=%#x dig=%#x (stat %#x %#x %#x)\n",
++	    hw_rd(cmu, cmu_phymux[0]), hw_rd(cmu, cmu_phymux[1]), hw_rd(cmu, cmu_phymux[2]),
++	    hw_rd(cmu, cmu_phymux_stat[0]), hw_rd(cmu, cmu_phymux_stat[1]), hw_rd(cmu, cmu_phymux_stat[2]));
++}
++
++static void
++hw_power(void)
++{
++	printf("HEROLTE WIFI: stage 2: WLAN_EN high, PERST low, PCIe0 gates, PHY isolation off\n");
++	hw_checkpoint("WLAN_EN, PERST and CLKREQ pins");
++	hw_pin_level(PIN_PERST, 0);
++	hw_pin_func(PIN_PERST, 1);
++	hw_pin_func(PIN_CLKREQ, 2);
++	hw_pin_level(PIN_WLAN_EN, 1);
++	hw_pin_func(PIN_WLAN_EN, 1);
++	hw_msleep(100);
++
++	hw_checkpoint("CMU_FSYS1 PCIe0 gates");
++	uint32_t cg = hw_rd(cmu, CMU_CG_VAL_ACLK);
++	hw_wr(cmu, CMU_CG_VAL_ACLK, cg | CG_PCIE0_MASK);
++	printf("HEROLTE WIFI: cg_val %#x -> %#x\n", cg, hw_rd(cmu, CMU_CG_VAL_ACLK));
++
++	hw_checkpoint("PMU PHY isolation");
++	uint32_t pc = hw_rd(pmu, PMU_PCIE_PHY_CTL);
++	hw_wr(pmu, PMU_PCIE_PHY_CTL, (pc & ~1u) | 1u);
++	printf("HEROLTE WIFI: PCIE_PHY_CONTROL %#x -> %#x\n", pc, hw_rd(pmu, PMU_PCIE_PHY_CTL));
++
++	hw_checkpoint("PHY power-down clear (first PHY access)");
++	uint32_t v = hw_rd(phy, 0x15 * 4);
++	hw_wr(phy, 0x15 * 4, v & ~(0xfu << 3));
++	hw_wr(phy, 0x4e * 4, 0);
++	hw_wr(phy, 0x4f * 4, 0);
++	printf("HEROLTE WIFI: PHY power-down clear: reg 0x54 %#x -> %#x\n", v, hw_rd(phy, 0x15 * 4));
++}
++
++static void
++hw_pulse(vm_offset_t base, uint32_t off)
++{
++	hw_wr(base, off, 1); hw_udelay(10);
++	hw_wr(base, off, 0); hw_udelay(10);
++	hw_wr(base, off, 1); hw_udelay(10);
++}
++
++static void
++hw_link(void)
++{
++	int i, up = 0;
++	uint32_t v, st = 0;
++
++	printf("HEROLTE WIFI: stage 3: PHY setup and link training\n");
++	hw_checkpoint("PCS/ELBI resets and PERST release");
++	hw_wr(pcs, 0xec, hw_rd(pcs, 0xec) | (1u << 3));          /* no rx elecidle check on DBI access */
++	hw_wr(elbi, ELBI_SOFT_CORE_RST, 0);
++	hw_udelay(20);
++	hw_wr(elbi, ELBI_SOFT_CORE_RST, 1);
++
++	hw_pin_level(PIN_PERST, 1);                              /* release PERST */
++	hw_msleep(20);
++
++	v = hw_rd(elbi, ELBI_REQ_EXIT_L1) | 0x1u | (1u << 4);
++	hw_wr(elbi, ELBI_REQ_EXIT_L1, v);
++	hw_wr(elbi, ELBI_LINKDOWN_SEL, 1u << 1);
++
++	hw_checkpoint("PHY configuration");
++	/* exynos_pcie_phy_config */
++	hw_wr(sysreg, SYSREG_A, hw_rd(sysreg, SYSREG_A) & ~(1u << 1));
++	v = hw_rd(sysreg, SYSREG_B);
++	v = (((v & ~(0xfu << 4)) & ~(0xfu << 2)) | (0x3u << 2)) & ~(1u << 1);
++	hw_wr(sysreg, SYSREG_B, v);
++	hw_pulse(elbi, ELBI_RST_PCS_G);
++	for (i = 0; i < 26; i++) {
++		hw_wr(phy, i * 4, phy_cmn[i]);
++	}
++	for (i = 0; i < 41; i++) {
++		hw_wr(phy, (0x30 + i) * 4, phy_trsv[i]);
++	}
++	hw_wr(phy, 0x5c * 4, 0x14);                              /* tx amplitude */
++	hw_wr(pcs, 0xf8, 0x70);                                  /* tx latency */
++	hw_wr(pcs, 0x0c, hw_rd(pcs, 0x0c) | (1u << 4));          /* PRGM_TIMEOUT_L1SS_VAL */
++	hw_pulse(elbi, ELBI_RST_MAC_CMN);
++	hw_pulse(elbi, ELBI_RST_PCS_CMN);
++
++	hw_checkpoint("PHY user muxes");
++	/* PHY clocks: user muxes to the PHY output (clear bit 27, then select 1 in bit 12) */
++	for (i = 0; i < 3; i++) {
++		v = hw_rd(cmu, cmu_phymux[i]);
++		hw_wr(cmu, cmu_phymux[i], v & ~(1u << 27));
++		v = hw_rd(cmu, cmu_phymux[i]);
++		hw_wr(cmu, cmu_phymux[i], v | (1u << 12));
++		hw_udelay(50);
++	}
++	printf("HEROLTE WIFI: PHY user muxes now %#x %#x %#x (stat %#x %#x %#x)\n",
++	    hw_rd(cmu, cmu_phymux[0]), hw_rd(cmu, cmu_phymux[1]), hw_rd(cmu, cmu_phymux[2]),
++	    hw_rd(cmu, cmu_phymux_stat[0]), hw_rd(cmu, cmu_phymux_stat[1]), hw_rd(cmu, cmu_phymux_stat[2]));
++
++	hw_wr(elbi, ELBI_SW_WAKE, hw_rd(elbi, ELBI_SW_WAKE) & ~(1u << 1));
++	hw_wr(elbi, ELBI_L1_BUG_FIX, 1);
++	hw_wr(pcs, 0xec, hw_rd(pcs, 0xec) & ~(1u << 3));
++
++	hw_checkpoint("LTSSM enable");
++	hw_wr(elbi, ELBI_LTSSM_EN, 1);                           /* start link training */
++	for (i = 0; i < 2000; i++) {
++		st = hw_rd(elbi, ELBI_LINKUP) & 0x1f;
++		if (st >= 0x0d && st <= 0x14) {
++			up = 1;
++			break;
++		}
++		hw_udelay(10);
++	}
++	printf("HEROLTE WIFI: link %s, ELBI RDLH_LINKUP=%#x (L0 is 0x0d-0x14), after %d polls\n",
++	    up ? "UP" : "NOT up", hw_rd(elbi, ELBI_LINKUP), i);
++}
++
++static void
++hw_thread(__unused void *arg, __unused wait_result_t wr)
++{
++	/* Let the root mount and the persistent log start first. */
++	hw_msleep(3000);
++	printf("HEROLTE WIFI: stage %d requested\n", hw_stage);
++	hw_report();
++	if (hw_stage >= 2) {
++		hw_power();
++	}
++	if (hw_stage >= 3) {
++		hw_link();
++		hw_report();
++	}
++	printf("HEROLTE WIFI: done\n");
++}
++
++void
++herolte_wifi_probe(void)
++{
++	thread_t thread;
++
++	PE_parse_boot_argn("herowifi", &hw_stage, sizeof(hw_stage));
++	PE_parse_boot_argn("herowifislow", &hw_slow, sizeof(hw_slow));
++	if (hw_stage <= 0) {
++		printf("HEROLTE WIFI: disabled (boot-arg herowifi=1/2/3 enables stages)\n");
++		return;
++	}
++	pmu = ml_io_map(HW_PMU_PA, 0x8000);
++	gpio = ml_io_map(HW_GPIO_PA, 0x1000);
++	cmu = ml_io_map(HW_CMU_PA, 0x2000);
++	phy = ml_io_map(HW_PHY_PA, 0x1000);
++	elbi = ml_io_map(HW_ELBI_PA, 0x1000);
++	pcs = ml_io_map(HW_PCS_PA, 0x1000);
++	sysreg = ml_io_map(HW_SYSREG_PA, 0x1000);
++	if (!pmu || !gpio || !cmu || !phy || !elbi || !pcs || !sysreg) {
++		printf("HEROLTE WIFI: MMIO mapping failed\n");
++		return;
++	}
++	if (kernel_thread_start(hw_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	}
++}
++#endif
+diff --git a/iokit/bsddev/IOKitBSDInit.cpp b/iokit/bsddev/IOKitBSDInit.cpp
+--- a/iokit/bsddev/IOKitBSDInit.cpp
++++ b/iokit/bsddev/IOKitBSDInit.cpp
+@@ -781,6 +781,9 @@
+ 	/* Mali-T880 read-only probe (bsd/dev/herolte_gpu.c). */
+ 	extern void herolte_gpu_probe(void);
+ 	herolte_gpu_probe();
++	/* BCM4359 Wi-Fi PCIe bring-up, stages 1-3 (bsd/dev/herolte_wifi.c). */
++	extern void herolte_wifi_probe(void);
++	herolte_wifi_probe();
+ #else
+ 	/* Exynos 7580 I2C touch. */
+ 	a5xelte_touch_probe();
