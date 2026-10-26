@@ -48,7 +48,7 @@ kern_return_t IOConnectCallMethod(io_connect_t connection, uint32_t selector,
 
 #define EXPORT __attribute__((visibility("default")))
 
-enum { SEL_PARAM, SEL_CREATE, SEL_FREE, SEL_MAP, SEL_SUBMIT, SEL_LOG };
+enum { SEL_PARAM, SEL_CREATE, SEL_FREE, SEL_MAP, SEL_SUBMIT, SEL_LOG, SEL_SURFACE_BO, SEL_SYNC_BO };
 
 #define MAX_BOS 4096
 
@@ -60,6 +60,8 @@ struct hbo {
 static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
 static io_connect_t conn;
 static struct hbo bos[MAX_BOS + 1];     /* by kernel handle */
+#define MAX_PRIME 256
+static struct { int fd; uint32_t handle; } primes[MAX_PRIME];  /* imported surfaces' stand-in descriptors */
 static int debug = -1;
 static uint64_t submits, faults;
 
@@ -237,6 +239,11 @@ free_bo(uint32_t handle)
    uint64_t in = handle;
    call(SEL_FREE, &in, 1, NULL, 0);
    memset(&bos[handle], 0, sizeof(bos[handle]));
+   for (int i = 0; i < MAX_PRIME; i++)
+      if (primes[i].handle == handle) {      /* an imported surface: its stand-in descriptor goes too */
+         close(primes[i].fd);
+         primes[i].handle = 0;
+      }
    DBG("FREE_BO %u", handle);
    return 0;
 }
@@ -437,7 +444,79 @@ drmCloseBufferHandle(int fd, uint32_t handle)
    return r;
 }
 
-/* No dma-buf: nothing is shared with another process. */
+/*
+ * IOSurfaces as GPU buffers (kernel 0248, HeroGPU SurfaceBO): Panfrost
+ * imports foreign memory only as a dma-buf file descriptor. A surface import
+ * gets a /dev/null descriptor that stands for its BO: drmPrimeFDToHandle
+ * gives the handle and herodrm_prime_size() the size (Mesa's
+ * pan_kmod_bo_import is patched to ask it instead of lseek on Apple).
+ */
+struct herodrm_surface {
+   uint32_t handle, bytes_per_row, width, height, pixel_format, offset, planes;
+   uint64_t size;
+};
+
+EXPORT int
+herodrm_surface_import(uint32_t surface_id, struct herodrm_surface *info)
+{
+   int r = -1;
+   pthread_mutex_lock(&lock);
+   if (connect_gpu() == 0) {
+      uint64_t in = surface_id, out[9] = {0};
+      uint32_t kr = call(SEL_SURFACE_BO, &in, 1, out, 9);
+      if (kr == 0 && out[0] && out[0] <= MAX_BOS) {
+         int slot = -1;
+         for (int i = 0; i < MAX_PRIME && slot < 0; i++)
+            if (!primes[i].handle)
+               slot = i;
+         int fd = slot >= 0 ? open("/dev/null", O_RDONLY | O_CLOEXEC) : -1;
+         if (fd >= 0) {
+            bos[out[0]] = (struct hbo){ .va = out[1], .size = out[2] };
+            primes[slot].fd = fd;
+            primes[slot].handle = (uint32_t)out[0];
+            *info = (struct herodrm_surface){ .handle = (uint32_t)out[0], .size = out[2],
+               .bytes_per_row = (uint32_t)out[3], .width = (uint32_t)out[4], .height = (uint32_t)out[5],
+               .pixel_format = (uint32_t)out[6], .offset = (uint32_t)out[7], .planes = (uint32_t)out[8] };
+            r = fd;
+            DBG("surface %u imported: BO %u at 0x%llx, %ux%u bpr %u fmt 0x%x", surface_id,
+                (unsigned)out[0], (unsigned long long)out[1], info->width, info->height,
+                info->bytes_per_row, info->pixel_format);
+         } else {
+            in = out[0];
+            call(SEL_FREE, &in, 1, NULL, 0);
+         }
+      } else if (debug > 0) {
+         herodrm_log("surface %u: no GPU import (kr 0x%x)", surface_id, kr);
+      }
+   }
+   pthread_mutex_unlock(&lock);
+   return r < 0 ? fail(ENOENT) : r;
+}
+
+/* Make the GPU's writes into an imported surface visible to the CPU and the display. */
+EXPORT int
+herodrm_bo_sync(uint32_t handle)
+{
+   pthread_mutex_lock(&lock);
+   uint64_t in = handle;
+   uint32_t kr = conn ? call(SEL_SYNC_BO, &in, 1, NULL, 0) : 1;
+   pthread_mutex_unlock(&lock);
+   return kr ? fail(EINVAL) : 0;
+}
+
+EXPORT int64_t
+herodrm_prime_size(int prime_fd)
+{
+   int64_t size = -1;
+   pthread_mutex_lock(&lock);
+   for (int i = 0; i < MAX_PRIME; i++)
+      if (primes[i].handle && primes[i].fd == prime_fd && lookup(primes[i].handle))
+         size = (int64_t)bos[primes[i].handle].size;
+   pthread_mutex_unlock(&lock);
+   return size;
+}
+
+/* No export: nothing is shared with another process. */
 EXPORT int
 drmPrimeHandleToFD(int fd, uint32_t handle, uint32_t flags, int *prime_fd)
 {
@@ -448,8 +527,16 @@ drmPrimeHandleToFD(int fd, uint32_t handle, uint32_t flags, int *prime_fd)
 EXPORT int
 drmPrimeFDToHandle(int fd, int prime_fd, uint32_t *handle)
 {
-   (void)fd; (void)prime_fd; (void)handle;
-   return fail(ENOSYS);
+   (void)fd;
+   int r = fail(ENOENT);
+   pthread_mutex_lock(&lock);
+   for (int i = 0; i < MAX_PRIME; i++)
+      if (primes[i].handle && primes[i].fd == prime_fd) {
+         *handle = primes[i].handle;
+         r = 0;
+      }
+   pthread_mutex_unlock(&lock);
+   return r;
 }
 
 /* Syncobjs: submits are synchronous, so every syncobj is signaled. */

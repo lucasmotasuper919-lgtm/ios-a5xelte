@@ -48,6 +48,17 @@ edit('src/panfrost/lib/kmod/pan_kmod.h',
      "                       mmap_offset + bo_offset);\n   if (host_addr == MAP_FAILED) {",
      "                       mmap_offset + bo_offset);\n#endif\n   if (host_addr == MAP_FAILED) {")
 
+# Imported IOSurfaces (herodrm_surface_import) are stand-in descriptors, not
+# dma-bufs: their size comes from the libdrm stand-in.
+edit('src/panfrost/lib/kmod/pan_kmod.c',
+     "      size_t size = lseek(fd, 0, SEEK_END);\n",
+     "#ifdef __APPLE__\n"
+     "      extern int64_t herodrm_prime_size(int fd);\n"
+     "      size_t size = (size_t)herodrm_prime_size(fd);\n"
+     "#else\n"
+     "      size_t size = lseek(fd, 0, SEEK_END);\n"
+     "#endif\n")
+
 edit('src/gallium/drivers/panfrost/pan_bo.c',
      "   if (os_munmap((void *)(uintptr_t)bo->ptr.cpu, panfrost_bo_size(bo))) {",
      "#ifdef __APPLE__\n"
@@ -93,6 +104,11 @@ edit('src/gallium/frontends/osmesa/osmesa.c',
      "      ? API_OPENGL_CORE : API_OPENGL_COMPAT;\n"
      "   if (profile == 0x36) /* GLES context: major 1 = ES1, else ES2/ES3 */\n"
      "      attribs.profile = (version_major == 1) ? API_OPENGLES : API_OPENGLES2;\n")
+
+# The OSMesaSweet* entry points the EAGL shim uses (GPU blit into IOSurfaces).
+osmesa_c = mesa / 'src/gallium/frontends/osmesa/osmesa.c'
+osmesa_c.write_text(osmesa_c.read_text() + '\n' + (here / 'osmesa_hero.inc').read_text())
+print('appended osmesa_hero.inc')
 
 shutil.copy(here / 'hero_hw.c', mesa / 'src/gallium/targets/osmesa/hero_hw.c')
 print('copied hero_hw.c')
