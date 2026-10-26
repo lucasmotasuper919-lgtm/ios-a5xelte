@@ -4,7 +4,7 @@
 `src/macro_ctx.c`, `src/macro_ctx.h`, `src/macro_slots.c`, `src/osm.h`, `tools/gen_gl_stubs.py` and
 `test/eagl_ca_test.m` are Bergamota's EAGL shim (https://github.com/ry-diffusion/Bergamota, branch
 `gpu-eagl`, `gpu/eagl/`), MIT, copied with their SPDX headers; unchanged except a crash reporter added at
-the top of `main()` in `eagl_ca_test.m`. `src/osm.c` is based on theirs.
+the top of `main()` in `eagl_ca_test.m` and an `EAGL_TRACE_ON` switch in `macro_ctx.c`. `src/osm.c` is based on theirs.
 Thanks to the Bergamota authors: their shim is what lets CoreAnimation's GLES renderer run on Mesa.
 
 The `macro_slots.c` offsets were derived from iOS 18 (22H352); the same offsets were checked against this

@@ -37,7 +37,23 @@ static void *pump(void *arg) {
     }
 }
 
+// Extra KEY=VALUE lines for the shim (debug and trace switches) from the drop zone, so they change without a new
+// kernel: the kernel only sets DYLD_INSERT_LIBRARIES and HERO_LOG_STDERR.
+static void load_gl_env(void) {
+    FILE *f = fopen("/private/var/herolte/gl.env", "r");
+    char line[256];
+    while (f && fgets(line, sizeof line, f)) {
+        line[strcspn(line, "\r\n")] = 0;
+        char *eq = strchr(line, '=');
+        if (line[0] == '#' || !eq) continue;
+        *eq = 0;
+        setenv(line, eq + 1, 1);
+    }
+    if (f) fclose(f);
+}
+
 __attribute__((constructor)) static void hero_log_init(void) {
+    if (getenv("HERO_LOG_STDERR")) load_gl_env();
     const char *on = getenv("HERO_LOG_STDERR");
     if (!on || *on != '1') return;
     klog = (void (*)(const char *, ...))dlsym(RTLD_DEFAULT, "herodrm_log");

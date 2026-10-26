@@ -26,6 +26,9 @@ void gl_trace_hook(int idx, long a, long b, long c, long d) {
 
 void *macro_ctx_new(void *rend) {
     void *const *thunks = getenv("EAGL_TRACE") ? mt_thunks : ms_thunks;
+    // Galaxy S7 port: EAGL_TRACE_ON=1 (with EAGL_TRACE=1) traces from the first call, for processes that cannot call
+    // EAGLShimSetTrace (backboardd). Read here, not in a constructor: gl.env (hero_log.c) is loaded by a later one.
+    if (getenv("EAGL_TRACE_ON")) g_trace_on = 1;
     void **m = calloc(1, MACRO_CTX_SIZE);
     if (!m) return NULL;
     m[0] = rend;
