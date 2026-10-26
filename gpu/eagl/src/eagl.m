@@ -130,10 +130,13 @@ struct _EAGLContextPrivate {
     int cur_att;                    // index of the attachment the bound draw framebuffer renders into (colour 0), -1 = none
     GLuint tmpfbo;
     EAGLMacroContext *macro;
+    EAGLContext *owner;             // Galaxy S7 port: the context this block belongs to (eagl_macro_ensure)
 };
 
 static pthread_key_t g_tls;
 static pthread_once_t g_tls_once = PTHREAD_ONCE_INIT;
+// Galaxy S7 port: the private block of the context current on this thread, as eagl_macro_ensure() last saw it.
+static __thread struct _EAGLContextPrivate *g_macro_cur;
 static void tls_init(void) { pthread_key_create(&g_tls, NULL); }
 
 // --- helpers ---------------------------------------------------------------------------------------------
@@ -672,7 +675,8 @@ static void eagl_install_hooks(void) {
         pthread_mutex_unlock(&g->lock);
         if (!p->osm) { EAGL_DEBUG("OSMesaCreateContextAttribs failed (api %d)\n", (int)api); [self release]; return nil; }
         EAGL_DEBUG("context %p created api %d sharegroup %p osm %p shared-with %p\n", self, (int)api, p->sg, p->osm, share);
-        p->macro = macro_ctx_new(p);   // rend = our private block; the slots ignore it (Mesa uses the thread's current context)
+        p->macro = macro_ctx_new(p);   // rend = our private block; eagl_macro_ensure() makes it current on the calling thread
+        p->owner = self;
     }
     return self;
 }
@@ -715,10 +719,24 @@ static void eagl_install_hooks(void) {
         osm_make_current(NULL, NULL, 0, 0);
     }
     pthread_setspecific(g_tls, ctx);
+    g_macro_cur = ctx ? ctx->_private : NULL;
     [old release];
     return YES;
 }
 + (EAGLContext *)currentContext { return [[cur_ctx() retain] autorelease]; }
+
+// Galaxy S7 port. Apple's macro context dispatches to the context its `rend` names, whatever is current on the
+// thread; the forwarders here go through Mesa's per-thread current context. iOS 16's render server makes its
+// context current on one thread and draws from another, so its calls reached no context (glGenTextures gave 0,
+// nothing was drawn). Every macro-context forwarder calls this first: when `rend` is not the thread's current
+// context, it is made current. One thread-local compare when nothing changes.
+__attribute__((visibility("hidden"))) void eagl_macro_ensure(void *rend) {
+    struct _EAGLContextPrivate *p = rend;
+    if (!p || p == g_macro_cur) return;
+    static int logged;
+    if (g_debug && logged++ < 8) fprintf(stderr, "EAGL(shim): macro call for context %p (block %p) on a thread where block %p is current: switching\n", p->owner, p, g_macro_cur);
+    if (p->owner) [EAGLContext setCurrentContext:p->owner];
+}
 
 - (EAGLRenderingAPI)API { return _private->api; }
 - (EAGLSharegroup *)sharegroup { return _private->sg; }

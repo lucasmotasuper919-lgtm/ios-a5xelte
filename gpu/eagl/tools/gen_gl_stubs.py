@@ -56,8 +56,20 @@ def main():
     # shifting x1..x7 down and tail-call the same entry point. Entry points with 8+ arguments need a C wrapper
     # (src/macro_ctx.c, mw_<base name>) because their arguments spill to the stack.
     w('')
+    # Galaxy S7 port: first make `rend`'s context current on this thread (eagl_macro_ensure in eagl.m; iOS 16's
+    # render server draws from a thread where its context is not current), keeping every argument register.
+    w('#define GL_ENSURE \\')
+    w('        "stp x29, x30, [sp, #-16]!\\n mov x29, sp\\n sub sp, sp, #192\\n" \\')
+    w('        "stp x0, x1, [sp, #0]\\n stp x2, x3, [sp, #16]\\n stp x4, x5, [sp, #32]\\n stp x6, x7, [sp, #48]\\n" \\')
+    w('        "stp q0, q1, [sp, #64]\\n stp q2, q3, [sp, #96]\\n stp q4, q5, [sp, #128]\\n stp q6, q7, [sp, #160]\\n" \\')
+    w('        "bl _eagl_macro_ensure\\n" \\')
+    w('        "ldp x0, x1, [sp, #0]\\n ldp x2, x3, [sp, #16]\\n ldp x4, x5, [sp, #32]\\n ldp x6, x7, [sp, #48]\\n" \\')
+    w('        "ldp q0, q1, [sp, #64]\\n ldp q2, q3, [sp, #96]\\n ldp q4, q5, [sp, #128]\\n ldp q6, q7, [sp, #160]\\n" \\')
+    w('        "add sp, sp, #192\\n ldp x29, x30, [sp], #16\\n"')
+    w('extern void eagl_macro_ensure(void *rend);')
     w('#define GL_MSTUB(name, idx) \\')
     w('    __attribute__((visibility("hidden"), naked, used)) void ms_##name(void) { __asm__ volatile( \\')
+    w('        GL_ENSURE \\')
     w('        "adrp x16, _gl_tab@PAGE\\n" \\')
     w('        "add x16, x16, _gl_tab@PAGEOFF\\n" \\')
     w('        "ldr x16, [x16, #" #idx "*8]\\n" \\')
@@ -73,6 +85,7 @@ def main():
     # Tracing variant (EAGL_TRACE=1): save the argument registers, log the call (name + first four integer args after `rend`), forward.
     w('#define GL_TSTUB(name, idx) \\')
     w('    __attribute__((visibility("hidden"), naked, used)) void mt_##name(void) { __asm__ volatile( \\')
+    w('        GL_ENSURE \\')
     w('        "stp x29, x30, [sp, #-16]!\\n mov x29, sp\\n sub sp, sp, #144\\n" \\')
     w('        "stp x0, x1, [sp, #0]\\n stp x2, x3, [sp, #16]\\n stp x4, x5, [sp, #32]\\n stp x6, x7, [sp, #48]\\n" \\')
     w('        "stp q0, q1, [sp, #64]\\n stp q2, q3, [sp, #96]\\n" \\')

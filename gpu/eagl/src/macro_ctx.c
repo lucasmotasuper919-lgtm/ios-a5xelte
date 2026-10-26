@@ -52,7 +52,8 @@ static void *target(const char *name) {
     for (int i = 0; i < gl_nfuncs; i++) if (!strcmp(gl_names[i], name)) return gl_tab[i];
     return (void *)macro_unmapped;
 }
-#define CACHED(name) static void *t; if (!t) t = target(name)
+extern void eagl_macro_ensure(void *rend);      // eagl.m (Galaxy S7 port): `r`'s context current on this thread
+#define CACHED(name) eagl_macro_ensure(r); static void *t; if (!t) t = target(name)
 
 // Debug log of the big/compressed texture uploads CoreAnimation does through the 8+ argument entry points (EAGL_SHIM_DEBUG): what it asks for,
 // where the data comes from (client pointer or a bound pixel-unpack buffer) and the GL error afterwards.
