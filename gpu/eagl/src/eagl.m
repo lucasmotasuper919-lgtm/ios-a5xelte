@@ -47,7 +47,7 @@
 // Live IOSurface textures: iOS binds an IOSurface as texture storage, so a producer that writes the surface after the bind (glyph renderers, snapshot
 // decoders, Control Center material) is seen at once. The shim copies at bind time; to keep the same behaviour every uploaded surface is remembered with its
 // IOSurface seed and the texture is re-uploaded when it is bound again (glBindTexture) after the seed changed.
-typedef struct { void *ctx; GLuint name; IOSurfaceRef surf; uint32_t seed, w, h, plane; GLenum ifmt, fmt, type; BOOL invert; BOOL wrapped; } LiveSrc;
+typedef struct { void *ctx; GLuint name; IOSurfaceRef surf; uint32_t seed, w, h, plane; GLenum ifmt, fmt, type; BOOL invert; BOOL wrapped; double synced; } LiveSrc;
 #define MAX_LIVE 768
 static LiveSrc g_live[MAX_LIVE]; static int g_nlive; static pthread_mutex_t g_live_lock = PTHREAD_MUTEX_INITIALIZER;
 static int g_wrapsample;              // BGL_WRAPSAMPLE=1 (marker word "wrapsample"): sample client-memory IOSurfaces with the GPU instead of copying them (experimental)
@@ -565,6 +565,9 @@ static void h_BindTexture(GLenum target, GLuint name) {
     for (int i = 0; i < g_nlive; i++) if (g_live[i].ctx == c && g_live[i].name == name) {
         uint32_t now = IOSurfaceGetSeed(g_live[i].surf);
         if (now != g_live[i].seed) { g_live[i].seed = now; e = g_live[i]; hit = YES; }
+        // Galaxy S7 port: a surface the GPU samples in place is also cleaned every 50 ms of use whether or not its seed moved:
+        // SpringBoard drew its icons without the seed changing here, and their copies stayed empty.
+        else if (g_live[i].wrapped) { double t = now_ms(); if (t - g_live[i].synced > 50.0) { g_live[i].synced = t; e = g_live[i]; hit = YES; } }
         break;
     }
     pthread_mutex_unlock(&g_live_lock);
@@ -998,6 +1001,7 @@ static DrawBind *find_bind(struct _EAGLContextPrivate *p, GLuint rb) {
             glTexParameteri((GLenum)target, GL_TEXTURE_MIN_FILTER, GL_LINEAR); glTexParameteri((GLenum)target, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
             glTexParameteri((GLenum)target, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE); glTexParameteri((GLenum)target, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
             EAGL_DEBUG("texImageIOSurface: surface %u sampled by the GPU in place (kind %d)\n", IOSurfaceGetID(ioSurface), kind);
+            { static int n; if (getenv("BGL_ICONDIAG") && n++ < 60) fprintf(stderr, "ICON wrap: surface %u %ux%u sampled in place (kind %d)\n", IOSurfaceGetID(ioSurface), w, h, kind); }
             return k >= 0;
         }
     }

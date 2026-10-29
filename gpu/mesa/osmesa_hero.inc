@@ -4,9 +4,9 @@
  * HeroGPU (targets/osmesa/hero_hw.c), appended to osmesa.c by
  * gpu/mesa/patch-mesa.py. The EAGL shim (gpu/eagl/src/osm.c) calls them:
  * the GPU copies CoreAnimation's render targets into the display
- * IOSurfaces instead of glReadPixels + a CPU copy. Sampling client-memory
- * surfaces in place and the writable CPU alias are not implemented yet
- * (they answer 0: the shim copies).
+ * IOSurfaces instead of glReadPixels + a CPU copy, and samples RGBA8/BGRA8
+ * surfaces in place (OSMesaSweetWrapTexture). The writable CPU alias is not
+ * implemented (it answers 0).
  */
 #include "main/context.h"
 #include "main/fbobject.h"
@@ -194,17 +194,49 @@ OSMesaSweetZeroTexture(void)
       st->pipe->clear_texture(st->pipe, t->pt, 0, &box, NULL);
 }
 
+/*
+ * Sample an IOSurface in place: level 0 of texture `name` becomes the
+ * surface's memory, as AttachDirect does for render targets. The shim
+ * (texImageIOSurface with BGL_WRAPSAMPLE=1) asks for it instead of copying
+ * the pixels: the copies of SpringBoard's icons were taken while still
+ * empty and never refreshed (the CPU renderer reads the memory each frame
+ * and drew them). kind (eagl.m): 4 RGBA8, 5 BGRA8; the others are copied.
+ */
 GLAPI int GLAPIENTRY
 OSMesaSweetWrapTexture(GLuint name, uint32_t surface_id, int kind, unsigned w, unsigned h)
 {
-   (void)name; (void)surface_id; (void)kind; (void)w; (void)h;
-   return 0;
+   OSMesaContext osmesa = OSMesaGetCurrentContext();
+   unsigned dw = 0, dh = 0;
+
+   if (!osmesa || !OSMesaSweetActive() || (kind != 4 && kind != 5))
+      return 0;
+   struct st_context *st = osmesa->st;
+   struct gl_context *ctx = st->ctx;
+   struct gl_texture_object *t = _mesa_lookup_texture(ctx, name);
+   if (!t || t->Target != GL_TEXTURE_2D)
+      return 0;
+   struct pipe_resource *res = hero_hw_surface_resource(surface_id, kind == 4 ? 2 : 0, &dw, &dh);
+   if (!res || dw != w || dh != h)
+      return 0;
+   struct gl_texture_image *img = _mesa_get_tex_image(ctx, t, GL_TEXTURE_2D, 0);
+   if (!img)
+      return 0;
+   hero_hw_surface_sync(surface_id);    /* the producer's CPU cache lines reach memory first */
+   struct st_egl_image stimg;
+   memset(&stimg, 0, sizeof(stimg));
+   stimg.texture = res;
+   stimg.format = res->format;
+   stimg.internalformat = GL_RGBA;
+   st_bind_egl_image(ctx, t, img, &stimg, false, true);
+   return t->surface_based && t->pt == res;
 }
 
+/* The producer wrote the surface again: clean its CPU cache lines to memory before the GPU samples it. */
 GLAPI void GLAPIENTRY
 OSMesaSweetWrapSync(uint32_t surface_id)
 {
-   (void)surface_id;
+   if (OSMesaSweetActive())
+      hero_hw_surface_sync(surface_id);
 }
 
 GLAPI int GLAPIENTRY
