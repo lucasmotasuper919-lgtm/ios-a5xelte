@@ -10,8 +10,11 @@
 #include <string.h>
 #include <unistd.h>
 
+void hero_prof_start(void);         // hero_prof.c: sampling profiler, HERO_PROF=1
+
 __attribute__((constructor)) static void hero_backboardd_init(void) {
     if (strcmp(getprogname(), "backboardd") != 0) return;
+    hero_prof_start();
     setenv("CA_DISABLE_FRAMEBUFFER_COMPRESSION", "1", 1);
     CFPreferencesSetAppValue(CFSTR("CAEnableFramebufferCompression"), kCFBooleanFalse, kCFPreferencesCurrentApplication);
     CFPreferencesSetAppValue(CFSTR("CAEnableIOSurfaceCompression"), kCFBooleanFalse, kCFPreferencesCurrentApplication);
