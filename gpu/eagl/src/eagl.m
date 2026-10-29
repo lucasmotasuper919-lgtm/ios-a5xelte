@@ -387,12 +387,20 @@ static void verify_direct(EAGLContext *c, Attach *a) {
     IOSurfaceUnlock(a->surf, kIOSurfaceLockReadOnly, NULL); free(buf);
 }
 
+// Galaxy S7 port: the GPU wrote the surface's memory behind IOSurface's back; a write lock/unlock pair bumps its seed so
+// every context that copied it earlier (texImageIOSurface's live table) uploads it again. Without it a surface that was
+// sampled while still empty (icons rendered by this render server) stayed blank for good.
+static void bump_seed(IOSurfaceRef s) {
+    if (IOSurfaceLock(s, 0, NULL) == KERN_SUCCESS) IOSurfaceUnlock(s, 0, NULL);
+}
+
 static void sync_att(EAGLContext *c, int i) {
     struct _EAGLContextPrivate *p = c->_private;
     Attach *a = &p->att[i];
         a->dirty = 0;
         if (a->direct) {
             double td = g_debug ? now_ms() : 0; osm_sweet_direct_sync(IOSurfaceGetID(a->surf)); if (g_debug) { g_ps_direct_ms += now_ms() - td; g_ps_direct_n++; }
+            bump_seed(a->surf);
             if (g_debug_frames) verify_direct(c, a);
             return;
         }
@@ -401,6 +409,7 @@ static void sync_att(EAGLContext *c, int i) {
         double t_start = g_debug ? now_ms() : 0;
         BOOL flip = a->kind ? a->inverted : !a->inverted;      // target-form attach (the render server): YES = rows flipped, NO = as GL has them (seen on the phone: NO + flip drew the UI upside down)
         if (osm_sweet_active() && osm_sweet_blit(a->name, isTex, IOSurfaceGetID(a->surf), flip, NO)) {
+            bump_seed(a->surf);
             if (g_debug) { frame_stats(a, t_start, now_ms(), 1); maybe_dump(c, i, isTex, (uint32_t)IOSurfaceGetWidth(a->surf), (uint32_t)IOSurfaceGetHeight(a->surf), YES); }
             return;
         }
@@ -861,7 +870,10 @@ static DrawBind *find_bind(struct _EAGLContextPrivate *p, GLuint rb) {
             glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
             glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
             glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-            if (g_direct && !inverted && osm_sweet_active() && IOSurfaceGetPixelFormat(surface) == 'BGRA' && osm_sweet_attach_direct(name, IOSurfaceGetID(surface))) direct = YES;
+            // Galaxy S7 port: CoreAnimation's own 4-byte surfaces with no fourcc (icons, layer caches) are BGRA too
+            OSType dpf = IOSurfaceGetPixelFormat(surface);
+            BOOL bgra_like = dpf == 'BGRA' || (dpf == 0 && IOSurfaceGetBytesPerElement(surface) == 4 && IOSurfaceGetPlaneCount(surface) == 0);
+            if (g_direct && !inverted && osm_sweet_active() && bgra_like && osm_sweet_attach_direct(name, IOSurfaceGetID(surface))) direct = YES;
             // keep what the surface already shows: CoreAnimation redraws only the damaged part of a swap-chain buffer
             else if (IOSurfaceGetPixelFormat(surface) == 'BGRA')
                 [self texImageIOSurface:surface target:GL_TEXTURE_2D internalFormat:GL_RGBA width:w height:h format:GL_BGRA_EXT type:GL_UNSIGNED_BYTE plane:0 invert:!inverted];   // same row order as the sync
