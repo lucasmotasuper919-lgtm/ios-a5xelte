@@ -394,6 +394,24 @@ static void bump_seed(IOSurfaceRef s) {
     if (IOSurfaceLock(s, 0, NULL) == KERN_SUCCESS) IOSurfaceUnlock(s, 0, NULL);
 }
 
+// Galaxy S7 port, BGL_ICONDIAG=1: after a small surface (icons, badges: <= 300x300) was written, log the path taken and how
+// many of its bytes the CPU sees non-zero. With the CPU renderer the icons draw; with this path they stayed blank or garbled.
+static void icon_diag(Attach *a, const char *path) {
+    static int on = -1, n;
+    if (on < 0) on = getenv("BGL_ICONDIAG") != NULL;
+    size_t w = IOSurfaceGetWidth(a->surf), h = IOSurfaceGetHeight(a->surf);
+    if (!on || w * h > 300 * 300 || n >= 300) return;
+    size_t bpr = IOSurfaceGetBytesPerRow(a->surf), nz = 0;
+    if (IOSurfaceLock(a->surf, kIOSurfaceLockReadOnly, NULL) != KERN_SUCCESS) return;
+    const uint8_t *p = IOSurfaceGetBaseAddress(a->surf);
+    if (p) for (size_t y = 0; y < h; y++) for (size_t x = 0; x < w * 4; x++) if (p[y * bpr + x]) nz++;
+    uint32_t mid = p ? *(const uint32_t *)(p + (h / 2) * bpr + (w / 2) * 4) : 0;
+    IOSurfaceUnlock(a->surf, kIOSurfaceLockReadOnly, NULL);
+    n++;
+    fprintf(stderr, "ICON surface %u %zux%zu fmt %08x bpr %zu kind %d inv %d path %s: %zu of %zu bytes non-zero, centre %08x\n",
+            IOSurfaceGetID(a->surf), w, h, (unsigned)IOSurfaceGetPixelFormat(a->surf), bpr, a->kind, a->inverted, path, nz, w * h * 4, mid);
+}
+
 static void sync_att(EAGLContext *c, int i) {
     struct _EAGLContextPrivate *p = c->_private;
     Attach *a = &p->att[i];
@@ -401,6 +419,7 @@ static void sync_att(EAGLContext *c, int i) {
         if (a->direct) {
             double td = g_debug ? now_ms() : 0; osm_sweet_direct_sync(IOSurfaceGetID(a->surf)); if (g_debug) { g_ps_direct_ms += now_ms() - td; g_ps_direct_n++; }
             bump_seed(a->surf);
+            icon_diag(a, "direct");
             if (g_debug_frames) verify_direct(c, a);
             return;
         }
@@ -410,6 +429,7 @@ static void sync_att(EAGLContext *c, int i) {
         BOOL flip = a->kind ? a->inverted : !a->inverted;      // target-form attach (the render server): YES = rows flipped, NO = as GL has them (seen on the phone: NO + flip drew the UI upside down)
         if (osm_sweet_active() && osm_sweet_blit(a->name, isTex, IOSurfaceGetID(a->surf), flip, NO)) {
             bump_seed(a->surf);
+            icon_diag(a, "gpu-blit");
             if (g_debug) { frame_stats(a, t_start, now_ms(), 1); maybe_dump(c, i, isTex, (uint32_t)IOSurfaceGetWidth(a->surf), (uint32_t)IOSurfaceGetHeight(a->surf), YES); }
             return;
         }
@@ -421,6 +441,7 @@ static void sync_att(EAGLContext *c, int i) {
             rgba_to_surface(buf, w, h, a->surf, flip, NO);
             free(buf);
         }
+        icon_diag(a, buf ? "cpu-copy" : "cpu-copy-failed");
         if (g_debug) { g_ps_cpu_ms += now_ms() - t_cpu0; g_ps_cpu_n++; }
         if (g_debug) { frame_stats(a, t_start, now_ms(), 0); maybe_dump(c, i, isTex, (uint32_t)IOSurfaceGetWidth(a->surf), (uint32_t)IOSurfaceGetHeight(a->surf), NO); }
 }
