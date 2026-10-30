@@ -258,6 +258,9 @@ struct eagl {
 	int blended;                    /* blending is off for such a draw, to be put back after it */
 	bool no_vibrant;                /* the first of the two could not be made */
 	GLint vibrant_matrix, vibrant_colours, masking_matrix, masking_colours;
+	GLuint vibrant_copy, backdrop;  /* (Galaxy S7 port) "vcm" from a copy of what is behind: see vibrant_copy_fragment */
+	GLint vibrant_copy_matrix, vibrant_copy_colours, vibrant_copy_origin;
+	bool backdrop_bound;            /* the copy is on unit BACKDROP_UNIT until plain_draw_end() */
 	GLbitfield unclear;             /* a glClear put off until the next draw (clear_now()), and what it was to be made with */
 	GLint unclear_box[4];
 	GLfloat unclear_colour[4];
@@ -1821,6 +1824,33 @@ static const char vibrant_fragment[] =
     "  s.rgb = clamp(s.rgb * s.a, 0., 1.);\n"
     "  result = mix(behind, s, layer.a);\n"
     "}\n";
+/*
+ * Galaxy S7 port: Panfrost on the Mali-T880 offers EXT_shader_framebuffer_fetch, but what CoreAnimation
+ * drew with it came out wrong (the lock screen's wallpaper black under the vibrancy gradient); with
+ * glfetch=0 the home screen's widgets and dock are drawn. Without the
+ * extension "vcm" reads what is behind from a copy of the framebuffer made just before the draw
+ * (unit 7, `origin` its corner in the framebuffer), the same arithmetic as vibrant_fragment.
+ */
+#define BACKDROP_UNIT   7
+#define GL_TEXTURE_MIN_FILTER           0x2801
+static const char vibrant_copy_fragment[] =
+    "#version 300 es\n"
+    "uniform lowp sampler2D texture0;\n"
+    "uniform mediump sampler2D backdrop;\n"
+    "uniform mediump vec4 colours[5];\n"
+    "uniform highp vec2 origin;\n"
+    "in lowp vec4 color;\n"
+    "in highp vec2 texcoord;\n"
+    "out highp vec4 result;\n"
+    "void main() {\n"
+    "  mediump vec4 layer = color * texture(texture0, texcoord / vec2(textureSize(texture0, 0)));\n"
+    "  mediump vec4 behind = texelFetch(backdrop, ivec2(gl_FragCoord.xy - origin), 0), s = behind;\n"
+    "  s.rgb = s.rgb / max(s.a, .005);\n"
+    "  s = s.r * colours[0] + s.g * colours[1] + s.b * colours[2] + s.a * colours[3] + colours[4];\n"
+    "  s.a = clamp(s.a, 0., 1.);\n"
+    "  s.rgb = clamp(s.rgb * s.a, 0., 1.);\n"
+    "  result = mix(behind, s, layer.a);\n"
+    "}\n";
 static const char masking_fragment[] =
     "#version 300 es\n"
     "uniform lowp sampler2D texture0;\n"
@@ -2977,6 +3007,62 @@ plain_draw_begin(struct eagl *e, GLint enabled[4])
 		trace_function_met = 1;
 	}
 	e->blended = 0;
+	if (e->bound[0] != 0 && plain_draws != 3 && function == FUNCTION_VIBRANT_MATRIX && !fetch_offered &&
+	    function_given[function] == 20) {
+		GLint box[4];
+
+		if (e->vibrant_copy == 0) {
+			e->vibrant_copy = plain_program(vibrant_copy_fragment, "a colour matrix over a copy of what is behind");
+			e->vibrant_copy_matrix = glGetUniformLocation(e->vibrant_copy, "vertex_matrix");
+			e->vibrant_copy_colours = glGetUniformLocation(e->vibrant_copy, "colours");
+			e->vibrant_copy_origin = glGetUniformLocation(e->vibrant_copy, "origin");
+			glUseProgram(e->vibrant_copy);
+			glUniform1i(glGetUniformLocation(e->vibrant_copy, "backdrop"), BACKDROP_UNIT);
+			glGenTextures(1, &e->backdrop);
+		}
+		/* what is behind, as far as the draw can reach: the viewport, inside the scissor box if there is one */
+		glGetIntegerv(GL_VIEWPORT, box);
+		if (glIsEnabled(GL_SCISSOR_TEST)) {
+			GLint s[4], x0, y0, x1, y1;
+
+			glGetIntegerv(GL_SCISSOR_BOX, s);
+			x0 = box[0] > s[0] ? box[0] : s[0];
+			y0 = box[1] > s[1] ? box[1] : s[1];
+			x1 = box[0] + box[2] < s[0] + s[2] ? box[0] + box[2] : s[0] + s[2];
+			y1 = box[1] + box[3] < s[1] + s[3] ? box[1] + box[3] : s[1] + s[3];
+			box[0] = x0;
+			box[1] = y0;
+			box[2] = x1 > x0 ? x1 - x0 : 0;
+			box[3] = y1 > y0 ? y1 - y0 : 0;
+		}
+		if (box[2] <= 0 || box[3] <= 0) {
+			census_draw(e, function, CENSUS_NOT_DRAWN);
+			return false;
+		}
+		glActiveTexture(GL_TEXTURE0 + BACKDROP_UNIT);
+		glBindTexture(GL_TEXTURE_2D, e->backdrop);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+		glCopyTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, box[0], box[1], box[2], box[3], 0);
+		glActiveTexture(GL_TEXTURE0 + e->unit);
+		e->backdrop_bound = true;
+		census_draw(e, function, CENSUS_VIBRANT);
+		glUseProgram(e->vibrant_copy);
+		glUniformMatrix4fv(e->vibrant_copy_matrix, 1, 0, e->matrix != NULL ? e->matrix : identity);
+		glUniform4fv(e->vibrant_copy_colours, 5, function_values[function]);
+		glUniform2f(e->vibrant_copy_origin, (GLfloat)box[0], (GLfloat)box[1]);
+		if (glIsEnabled(GL_BLEND)) {
+			e->blended = 1;                 /* the program has blended already */
+			glDisable(GL_BLEND);
+		}
+		for (GLuint i = 0; i < 3; i++) {
+			glGetVertexAttribiv(i, GL_VERTEX_ATTRIB_ARRAY_ENABLED, &enabled[i]);
+			if (!enabled[i]) {
+				glEnableVertexAttribArray(i);
+			}
+		}
+		return true;
+	}
 	if (e->bound[0] != 0 && plain_draws != 3 && function < 90 && ((function == FUNCTION_VIBRANT_MATRIX && fetch_offered) ||
 	    function == FUNCTION_MATRIX_PREMULTIPLIED) && function_given[function] == 20) {
 		bool vibrant = function == FUNCTION_VIBRANT_MATRIX;
@@ -3120,6 +3206,12 @@ plain_draw_end(struct eagl *e, const GLint enabled[4])
 		}
 		glActiveTexture(GL_TEXTURE0 + e->unit);
 		e->vblur_bound = false;
+	}
+	if (e->backdrop_bound) {        /* (Galaxy S7 port) unit 7 back as CoreAnimation had it */
+		glActiveTexture(GL_TEXTURE0 + BACKDROP_UNIT);
+		glBindTexture(GL_TEXTURE_2D, e->bound[BACKDROP_UNIT]);
+		glActiveTexture(GL_TEXTURE0 + e->unit);
+		e->backdrop_bound = false;
 	}
 	glUseProgram(0);
 	if (e->blended) {
