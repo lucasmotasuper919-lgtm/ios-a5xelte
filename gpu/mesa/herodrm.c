@@ -276,14 +276,17 @@ lookup(uint32_t handle)
 }
 
 static bool async_on;
+static uint64_t bo_last_job[MAX_BOS + 1];       /* by handle: the count of queued jobs when the last one naming it went on */
 static void queue_drain(void);
+static void bo_wait(uint32_t handle);
 
 static int
 free_bo(uint32_t handle)
 {
    if (!lookup(handle))
       return fail(EINVAL);
-   queue_drain();
+   bo_wait(handle);
+   bo_last_job[handle] = 0;
    uint64_t in = handle;
    call(SEL_FREE, &in, 1, NULL, 0);
    st.frees++;
@@ -393,9 +396,10 @@ submit_now(uint64_t jc, uint64_t js)
  * HERO_ASYNC=1: a submit goes on a queue and returns; a thread of its own
  * makes the kernel's call, which lasts as long as the job. In order, so one
  * job's results are there for the next, as the kernel's synchronous submits
- * always had it. Whoever must see the GPU done drains the queue: waits on a BO
- * or a syncobj, freeing a BO, cleaning a surface's caches. The worker takes no
- * lock of the callers', so they may drain with theirs held.
+ * always had it. A wait on a BO, or freeing one, waits for the last job that
+ * named it (a submit lists its BOs); a wait on a syncobj or cleaning a
+ * surface's caches drains the queue. The worker takes no lock of the
+ * callers', so they may wait with theirs held.
  */
 #define QUEUE_SIZE 64
 static struct { uint64_t jc, js; } queue[QUEUE_SIZE];
@@ -433,15 +437,27 @@ queue_drain(void)
    pthread_mutex_unlock(&qlock);
 }
 
+/* Is the last job that named this BO still queued or running? */
 static bool
-queue_busy(void)
+bo_busy(uint32_t handle)
 {
-   if (!async_on)
+   if (!async_on || !handle || handle > MAX_BOS)
       return false;
    pthread_mutex_lock(&qlock);
-   bool busy = finished != queued;
+   bool busy = finished < bo_last_job[handle];
    pthread_mutex_unlock(&qlock);
    return busy;
+}
+
+static void
+bo_wait(uint32_t handle)
+{
+   if (!async_on || !handle || handle > MAX_BOS)
+      return;
+   pthread_mutex_lock(&qlock);
+   while (finished < bo_last_job[handle])
+      pthread_cond_wait(&qdone, &qlock);
+   pthread_mutex_unlock(&qlock);
 }
 
 static int
@@ -468,6 +484,11 @@ submit(struct drm_panfrost_submit *s)
    queue[queued % QUEUE_SIZE].jc = s->jc;
    queue[queued % QUEUE_SIZE].js = js;
    queued++;
+   /* the job's BOs are busy until this job is finished (Mesa frees the list when this returns) */
+   const uint32_t *handles = (const uint32_t *)(uintptr_t)s->bo_handles;
+   for (uint32_t i = 0; i < s->bo_handle_count; i++)
+      if (handles[i] && handles[i] <= MAX_BOS)
+         bo_last_job[handles[i]] = queued;
    pthread_cond_signal(&qwork);
    pthread_mutex_unlock(&qlock);
    return 0;
@@ -517,11 +538,12 @@ drmIoctl(int fd, unsigned long request, void *arg)
       break;
    }
    case DRM_IOCTL_PANFROST_WAIT_BO:
-      /* (no per-BO tracking: "is it idle?" is answered for the whole queue) */
-      if (((struct drm_panfrost_wait_bo *)arg)->timeout_ns == 0 && queue_busy())
+      /* Only the jobs that named this BO: an idle one can be reused at once from Mesa's cache. */
+      if (((struct drm_panfrost_wait_bo *)arg)->timeout_ns == 0 &&
+          bo_busy(((struct drm_panfrost_wait_bo *)arg)->handle))
          r = fail(ETIMEDOUT);
       else
-         queue_drain();
+         bo_wait(((struct drm_panfrost_wait_bo *)arg)->handle);
       break;
    case DRM_IOCTL_PANFROST_MADVISE:
       ((struct drm_panfrost_madvise *)arg)->retained = 1;
