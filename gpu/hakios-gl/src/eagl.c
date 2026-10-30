@@ -226,6 +226,7 @@ struct image {
 	GLuint texture;
 	IOSurfaceRef surface;
 	bool target;                    /* drawn into (attachImage) rather than shown (texImageIOSurface) */
+	bool synced_pending;            /* (Galaxy S7 port) the GPU has copied into the surface: hakios_gl_surface_written() due */
 	bool invert, drawn;
 	bool shared;                    /* the texture is the surface's memory: nothing to copy */
 	GLuint mirror;                  /* a texture that is the surface's memory, which the GPU copies the frame into (blit_targets) */
@@ -1135,6 +1136,7 @@ frame_end(struct eagl *e, bool finished)
 	for (unsigned i = 0; i < e->image_count; i++) {
 		if (e->images[i].target && e->images[i].drawn && e->images[i].mirror != 0) {
 			target_to_surface(e, &e->images[i]);    /* (the GPU's copy: before what follows sends it out) */
+			e->images[i].synced_pending = true;
 			in_place++;
 			glFlush();                              /* (also after a glFinish: the copy is new since) */
 		}
@@ -1161,6 +1163,16 @@ frame_end(struct eagl *e, bool finished)
 		}
 	}
 	waited = now_us();
+	for (unsigned i = 0; i < e->image_count; i++) {
+		/* (Galaxy S7 port) the GPU's copy is in the surface's memory: out of the CPU's caches, for the display */
+		if (e->images[i].target && e->images[i].mirror != 0 && e->images[i].synced_pending) {
+			e->images[i].synced_pending = false;
+			hakios_gl_surface_written(e->gl, IOSurfaceGetID(e->images[i].surface));
+		}
+		if (e->images[i].target && e->images[i].drawn && e->images[i].shared) {
+			hakios_gl_surface_written(e->gl, IOSurfaceGetID(e->images[i].surface));
+		}
+	}
 	for (unsigned i = 0; i < e->image_count; i++) {
 		if (e->images[i].target && e->images[i].drawn) {
 			copied += !e->images[i].shared;

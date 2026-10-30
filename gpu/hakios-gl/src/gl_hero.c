@@ -30,6 +30,7 @@ extern void OSMesaDestroyContext(OSMesaContext context);
 extern void glGetIntegerv(unsigned name, int *value);
 extern int OSMesaSweetActive(void);
 extern int OSMesaSweetAttachDirect(unsigned name, uint32_t surface_id);
+extern void OSMesaSweetDirectSync(uint32_t surface_id);
 
 #define WINDOW  16
 
@@ -89,4 +90,19 @@ hakios_gl_surface_texture(struct hakios_gl *gl, uint32_t surface)
 	}
 	glGetIntegerv(GL_TEXTURE_BINDING_2D, &bound);
 	return bound != 0 && OSMesaSweetAttachDirect((unsigned)bound, surface);
+}
+
+/*
+ * The GPU has written the surface (eagl.c, frame_end()): wait for it and make what it wrote visible to the
+ * CPU and the display. The surfaces' memory is cached by the CPU here (unlike HakiOS's Adreno phones), and
+ * the display driver copies it with the CPU: without this it read lines left from earlier frames, which
+ * showed as blocks of old pictures wherever something moved.
+ */
+void
+hakios_gl_surface_written(struct hakios_gl *gl, uint32_t surface)
+{
+	(void)gl;
+	if (OSMesaSweetActive()) {
+		OSMesaSweetDirectSync(surface);
+	}
 }
