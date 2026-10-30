@@ -17,7 +17,9 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <pthread.h>
+#include <pthread/qos.h>
 #include <stdarg.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -273,11 +275,18 @@ lookup(uint32_t handle)
    return handle && handle <= MAX_BOS && bos[handle].va ? &bos[handle] : NULL;
 }
 
+static bool async_on;
+static uint64_t bo_last_job[MAX_BOS + 1];       /* by handle: the count of queued jobs when the last one naming it went on */
+static void queue_drain(void);
+static void bo_wait(uint32_t handle);
+
 static int
 free_bo(uint32_t handle)
 {
    if (!lookup(handle))
       return fail(EINVAL);
+   bo_wait(handle);
+   bo_last_job[handle] = 0;
    uint64_t in = handle;
    call(SEL_FREE, &in, 1, NULL, 0);
    st.frees++;
@@ -355,9 +364,9 @@ dump_chain(uint64_t jc)
 }
 
 static int
-submit(struct drm_panfrost_submit *s)
+submit_now(uint64_t jc, uint64_t js)
 {
-   uint64_t in[2] = { s->jc, (s->requirements & PANFROST_JD_REQ_FS) ? 0 : 1 }, out[2] = {0};
+   uint64_t in[2] = { jc, js }, out[2] = {0};
    uint64_t t0 = now_ns();
    uint32_t kr = call(SEL_SUBMIT, in, 2, out, 2);
    uint64_t t1 = now_ns();
@@ -370,17 +379,119 @@ submit(struct drm_panfrost_submit *s)
       faults++;
       if (faults <= 16 || debug > 0)
          herodrm_log("SUBMIT #%llu jc 0x%llx js %llu: kr 0x%x status 0x%llx (%llu us)",
-                     (unsigned long long)submits, (unsigned long long)s->jc,
-                     (unsigned long long)in[1], kr, (unsigned long long)out[0],
+                     (unsigned long long)submits, (unsigned long long)jc,
+                     (unsigned long long)js, kr, (unsigned long long)out[0],
                      (unsigned long long)out[1]);
-      if (faults <= 2)
-         dump_chain(s->jc);
+      if (faults <= 2 && !async_on)
+         dump_chain(jc);        /* (the BO table is the caller's, under its lock) */
    } else {
       DBG("SUBMIT #%llu jc 0x%llx js %llu: %llu us", (unsigned long long)submits,
-          (unsigned long long)s->jc, (unsigned long long)in[1], (unsigned long long)out[1]);
+          (unsigned long long)jc, (unsigned long long)js, (unsigned long long)out[1]);
    }
    /* A faulting job is reported, not fatal: Mesa would abort on an error. */
    return kr ? fail(EIO) : 0;
+}
+
+/*
+ * HERO_ASYNC=1: a submit goes on a queue and returns; a thread of its own
+ * makes the kernel's call, which lasts as long as the job. In order, so one
+ * job's results are there for the next, as the kernel's synchronous submits
+ * always had it. A wait on a BO, or freeing one, waits for the last job that
+ * named it (a submit lists its BOs); a wait on a syncobj or cleaning a
+ * surface's caches drains the queue. The worker takes no lock of the
+ * callers', so they may wait with theirs held.
+ */
+#define QUEUE_SIZE 64
+static struct { uint64_t jc, js; } queue[QUEUE_SIZE];
+static uint64_t queued, finished;       /* counts; queue[n % QUEUE_SIZE] */
+static pthread_mutex_t qlock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t qwork = PTHREAD_COND_INITIALIZER, qdone = PTHREAD_COND_INITIALIZER;
+
+static void *
+queue_worker(void *arg)
+{
+   (void)arg;
+   pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+   pthread_mutex_lock(&qlock);
+   for (;;) {
+      while (finished == queued)
+         pthread_cond_wait(&qwork, &qlock);
+      uint64_t jc = queue[finished % QUEUE_SIZE].jc, js = queue[finished % QUEUE_SIZE].js;
+      pthread_mutex_unlock(&qlock);
+      submit_now(jc, js);
+      pthread_mutex_lock(&qlock);
+      finished++;
+      pthread_cond_broadcast(&qdone);
+   }
+   return NULL;
+}
+
+static void
+queue_drain(void)
+{
+   if (!async_on)
+      return;
+   pthread_mutex_lock(&qlock);
+   while (finished != queued)
+      pthread_cond_wait(&qdone, &qlock);
+   pthread_mutex_unlock(&qlock);
+}
+
+/* Is the last job that named this BO still queued or running? */
+static bool
+bo_busy(uint32_t handle)
+{
+   if (!async_on || !handle || handle > MAX_BOS)
+      return false;
+   pthread_mutex_lock(&qlock);
+   bool busy = finished < bo_last_job[handle];
+   pthread_mutex_unlock(&qlock);
+   return busy;
+}
+
+static void
+bo_wait(uint32_t handle)
+{
+   if (!async_on || !handle || handle > MAX_BOS)
+      return;
+   pthread_mutex_lock(&qlock);
+   while (finished < bo_last_job[handle])
+      pthread_cond_wait(&qdone, &qlock);
+   pthread_mutex_unlock(&qlock);
+}
+
+static int
+submit(struct drm_panfrost_submit *s)
+{
+   static bool asked;
+   uint64_t js = (s->requirements & PANFROST_JD_REQ_FS) ? 0 : 1;
+
+   if (!asked) {
+      const char *a = getenv("HERO_ASYNC");
+      pthread_t thread;
+
+      asked = true;
+      async_on = a && *a == '1' && pthread_create(&thread, NULL, queue_worker, NULL) == 0;
+      herodrm_log("submits are %s", async_on ? "queued (HERO_ASYNC=1)" : "synchronous");
+   }
+   if (!async_on)
+      return submit_now(s->jc, js);
+   /* This thread's write-combined writes of the chain land before another core starts the job. */
+   __asm__ volatile ("dsb sy" ::: "memory");
+   pthread_mutex_lock(&qlock);
+   while (queued - finished == QUEUE_SIZE)
+      pthread_cond_wait(&qdone, &qlock);
+   queue[queued % QUEUE_SIZE].jc = s->jc;
+   queue[queued % QUEUE_SIZE].js = js;
+   queued++;
+   /* the job's BOs are busy until this job is finished (Mesa frees the list when this returns) */
+   const uint32_t *handles = (const uint32_t *)(uintptr_t)s->bo_handles;
+   for (uint32_t i = 0; i < s->bo_handle_count; i++)
+      if (handles[i] && handles[i] <= MAX_BOS)
+         bo_last_job[handles[i]] = queued;
+   pthread_cond_signal(&qwork);
+   pthread_mutex_unlock(&qlock);
+   return 0;
 }
 
 EXPORT int
@@ -427,7 +538,13 @@ drmIoctl(int fd, unsigned long request, void *arg)
       break;
    }
    case DRM_IOCTL_PANFROST_WAIT_BO:
-      break;            /* every submit has finished on return */
+      /* Only the jobs that named this BO: an idle one can be reused at once from Mesa's cache. */
+      if (((struct drm_panfrost_wait_bo *)arg)->timeout_ns == 0 &&
+          bo_busy(((struct drm_panfrost_wait_bo *)arg)->handle))
+         r = fail(ETIMEDOUT);
+      else
+         bo_wait(((struct drm_panfrost_wait_bo *)arg)->handle);
+      break;
    case DRM_IOCTL_PANFROST_MADVISE:
       ((struct drm_panfrost_madvise *)arg)->retained = 1;
       break;
@@ -547,6 +664,7 @@ EXPORT int
 herodrm_bo_sync(uint32_t handle)
 {
    pthread_mutex_lock(&lock);
+   queue_drain();
    uint64_t in = handle;
    uint32_t kr = conn ? call(SEL_SYNC_BO, &in, 1, NULL, 0) : 1;
    pthread_mutex_unlock(&lock);
@@ -613,6 +731,7 @@ drmSyncobjWait(int fd, uint32_t *handles, unsigned num_handles, int64_t timeout_
                unsigned flags, uint32_t *first_signaled)
 {
    (void)fd; (void)handles; (void)num_handles; (void)timeout_nsec; (void)flags;
+   queue_drain();
    if (first_signaled)
       *first_signaled = 0;
    return 0;

@@ -87,7 +87,7 @@ hero_hw_active(void)
  * caches are cleaned after each blit. Surfaces the path cannot use (other
  * formats, several planes) are remembered and left to the CPU copy.
  */
-#define MAX_SURF 64
+#define MAX_SURF 512            /* display targets plus the sampled icons and layer images (OSMesaSweetWrapTexture) */
 static struct {
    uint32_t id, handle;
    int opaque;
@@ -149,7 +149,9 @@ hero_hw_surface_resource(uint32_t surface_id, int opaque, unsigned *w, unsigned 
    struct pipe_resource templ;
    memset(&templ, 0, sizeof(templ));
    templ.target = PIPE_TEXTURE_2D;
-   templ.format = opaque ? PIPE_FORMAT_B8G8R8X8_UNORM : PIPE_FORMAT_B8G8R8A8_UNORM;
+   /* opaque: 0 BGRA, 1 BGRX (alpha written as 1), 2 RGBA (images CoreAnimation uploads as GL_RGBA) */
+   templ.format = opaque == 2 ? PIPE_FORMAT_R8G8B8A8_UNORM :
+                  opaque ? PIPE_FORMAT_B8G8R8X8_UNORM : PIPE_FORMAT_B8G8R8A8_UNORM;
    templ.width0 = sb.width;
    templ.height0 = sb.height;
    templ.depth0 = 1;

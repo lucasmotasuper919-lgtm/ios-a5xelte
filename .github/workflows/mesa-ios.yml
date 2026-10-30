@@ -12,6 +12,7 @@ on:
     paths:
       - "gpu/mesa/**"
       - "gpu/eagl/**"
+      - "gpu/hakios-gl/**"
       - ".github/workflows/mesa-ios.yml"
 
 jobs:

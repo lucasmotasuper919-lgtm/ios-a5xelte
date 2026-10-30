@@ -47,7 +47,7 @@
 // Live IOSurface textures: iOS binds an IOSurface as texture storage, so a producer that writes the surface after the bind (glyph renderers, snapshot
 // decoders, Control Center material) is seen at once. The shim copies at bind time; to keep the same behaviour every uploaded surface is remembered with its
 // IOSurface seed and the texture is re-uploaded when it is bound again (glBindTexture) after the seed changed.
-typedef struct { void *ctx; GLuint name; IOSurfaceRef surf; uint32_t seed, w, h, plane; GLenum ifmt, fmt, type; BOOL invert; BOOL wrapped; } LiveSrc;
+typedef struct { void *ctx; GLuint name; IOSurfaceRef surf; uint32_t seed, w, h, plane; GLenum ifmt, fmt, type; BOOL invert; BOOL wrapped; double synced; } LiveSrc;
 #define MAX_LIVE 768
 static LiveSrc g_live[MAX_LIVE]; static int g_nlive; static pthread_mutex_t g_live_lock = PTHREAD_MUTEX_INITIALIZER;
 static int g_wrapsample;              // BGL_WRAPSAMPLE=1 (marker word "wrapsample"): sample client-memory IOSurfaces with the GPU instead of copying them (experimental)
@@ -387,12 +387,39 @@ static void verify_direct(EAGLContext *c, Attach *a) {
     IOSurfaceUnlock(a->surf, kIOSurfaceLockReadOnly, NULL); free(buf);
 }
 
+// Galaxy S7 port: the GPU wrote the surface's memory behind IOSurface's back; a write lock/unlock pair bumps its seed so
+// every context that copied it earlier (texImageIOSurface's live table) uploads it again. Without it a surface that was
+// sampled while still empty (icons rendered by this render server) stayed blank for good.
+static void bump_seed(IOSurfaceRef s) {
+    if (IOSurfaceLock(s, 0, NULL) == KERN_SUCCESS) IOSurfaceUnlock(s, 0, NULL);
+}
+
+// Galaxy S7 port, BGL_ICONDIAG=1: after a small surface (icons, badges: <= 300x300) was written, log the path taken and how
+// many of its bytes the CPU sees non-zero. With the CPU renderer the icons draw; with this path they stayed blank or garbled.
+static void icon_diag(Attach *a, const char *path) {
+    static int on = -1, n;
+    if (on < 0) on = getenv("BGL_ICONDIAG") != NULL;
+    size_t w = IOSurfaceGetWidth(a->surf), h = IOSurfaceGetHeight(a->surf);
+    if (!on || w * h > 300 * 300 || n >= 300) return;
+    size_t bpr = IOSurfaceGetBytesPerRow(a->surf), nz = 0;
+    if (IOSurfaceLock(a->surf, kIOSurfaceLockReadOnly, NULL) != KERN_SUCCESS) return;
+    const uint8_t *p = IOSurfaceGetBaseAddress(a->surf);
+    if (p) for (size_t y = 0; y < h; y++) for (size_t x = 0; x < w * 4; x++) if (p[y * bpr + x]) nz++;
+    uint32_t mid = p ? *(const uint32_t *)(p + (h / 2) * bpr + (w / 2) * 4) : 0;
+    IOSurfaceUnlock(a->surf, kIOSurfaceLockReadOnly, NULL);
+    n++;
+    fprintf(stderr, "ICON surface %u %zux%zu fmt %08x bpr %zu kind %d inv %d path %s: %zu of %zu bytes non-zero, centre %08x\n",
+            IOSurfaceGetID(a->surf), w, h, (unsigned)IOSurfaceGetPixelFormat(a->surf), bpr, a->kind, a->inverted, path, nz, w * h * 4, mid);
+}
+
 static void sync_att(EAGLContext *c, int i) {
     struct _EAGLContextPrivate *p = c->_private;
     Attach *a = &p->att[i];
         a->dirty = 0;
         if (a->direct) {
             double td = g_debug ? now_ms() : 0; osm_sweet_direct_sync(IOSurfaceGetID(a->surf)); if (g_debug) { g_ps_direct_ms += now_ms() - td; g_ps_direct_n++; }
+            bump_seed(a->surf);
+            icon_diag(a, "direct");
             if (g_debug_frames) verify_direct(c, a);
             return;
         }
@@ -401,6 +428,8 @@ static void sync_att(EAGLContext *c, int i) {
         double t_start = g_debug ? now_ms() : 0;
         BOOL flip = a->kind ? a->inverted : !a->inverted;      // target-form attach (the render server): YES = rows flipped, NO = as GL has them (seen on the phone: NO + flip drew the UI upside down)
         if (osm_sweet_active() && osm_sweet_blit(a->name, isTex, IOSurfaceGetID(a->surf), flip, NO)) {
+            bump_seed(a->surf);
+            icon_diag(a, "gpu-blit");
             if (g_debug) { frame_stats(a, t_start, now_ms(), 1); maybe_dump(c, i, isTex, (uint32_t)IOSurfaceGetWidth(a->surf), (uint32_t)IOSurfaceGetHeight(a->surf), YES); }
             return;
         }
@@ -412,6 +441,7 @@ static void sync_att(EAGLContext *c, int i) {
             rgba_to_surface(buf, w, h, a->surf, flip, NO);
             free(buf);
         }
+        icon_diag(a, buf ? "cpu-copy" : "cpu-copy-failed");
         if (g_debug) { g_ps_cpu_ms += now_ms() - t_cpu0; g_ps_cpu_n++; }
         if (g_debug) { frame_stats(a, t_start, now_ms(), 0); maybe_dump(c, i, isTex, (uint32_t)IOSurfaceGetWidth(a->surf), (uint32_t)IOSurfaceGetHeight(a->surf), NO); }
 }
@@ -535,6 +565,9 @@ static void h_BindTexture(GLenum target, GLuint name) {
     for (int i = 0; i < g_nlive; i++) if (g_live[i].ctx == c && g_live[i].name == name) {
         uint32_t now = IOSurfaceGetSeed(g_live[i].surf);
         if (now != g_live[i].seed) { g_live[i].seed = now; e = g_live[i]; hit = YES; }
+        // Galaxy S7 port: a surface the GPU samples in place is also cleaned every 50 ms of use whether or not its seed moved:
+        // SpringBoard drew its icons without the seed changing here, and their copies stayed empty.
+        else if (g_live[i].wrapped) { double t = now_ms(); if (t - g_live[i].synced > 50.0) { g_live[i].synced = t; e = g_live[i]; hit = YES; } }
         break;
     }
     pthread_mutex_unlock(&g_live_lock);
@@ -861,7 +894,10 @@ static DrawBind *find_bind(struct _EAGLContextPrivate *p, GLuint rb) {
             glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
             glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
             glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-            if (g_direct && !inverted && osm_sweet_active() && IOSurfaceGetPixelFormat(surface) == 'BGRA' && osm_sweet_attach_direct(name, IOSurfaceGetID(surface))) direct = YES;
+            // Galaxy S7 port: CoreAnimation's own 4-byte surfaces with no fourcc (icons, layer caches) are BGRA too
+            OSType dpf = IOSurfaceGetPixelFormat(surface);
+            BOOL bgra_like = dpf == 'BGRA' || (dpf == 0 && IOSurfaceGetBytesPerElement(surface) == 4 && IOSurfaceGetPlaneCount(surface) == 0);
+            if (g_direct && !inverted && osm_sweet_active() && bgra_like && osm_sweet_attach_direct(name, IOSurfaceGetID(surface))) direct = YES;
             // keep what the surface already shows: CoreAnimation redraws only the damaged part of a swap-chain buffer
             else if (IOSurfaceGetPixelFormat(surface) == 'BGRA')
                 [self texImageIOSurface:surface target:GL_TEXTURE_2D internalFormat:GL_RGBA width:w height:h format:GL_BGRA_EXT type:GL_UNSIGNED_BYTE plane:0 invert:!inverted];   // same row order as the sync
@@ -965,6 +1001,7 @@ static DrawBind *find_bind(struct _EAGLContextPrivate *p, GLuint rb) {
             glTexParameteri((GLenum)target, GL_TEXTURE_MIN_FILTER, GL_LINEAR); glTexParameteri((GLenum)target, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
             glTexParameteri((GLenum)target, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE); glTexParameteri((GLenum)target, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
             EAGL_DEBUG("texImageIOSurface: surface %u sampled by the GPU in place (kind %d)\n", IOSurfaceGetID(ioSurface), kind);
+            { static int n; if (getenv("BGL_ICONDIAG") && n++ < 60) fprintf(stderr, "ICON wrap: surface %u %ux%u sampled in place (kind %d)\n", IOSurfaceGetID(ioSurface), w, h, kind); }
             return k >= 0;
         }
     }
