@@ -1882,10 +1882,8 @@ static const char vibrant_fragment[] =
     "  result = mix(behind, s, layer.a);\n"
     "}\n";
 /*
- * Galaxy S7 port: Panfrost on the Mali-T880 offers EXT_shader_framebuffer_fetch, but what CoreAnimation
- * drew with it came out wrong (the lock screen's wallpaper black under the vibrancy gradient); with
- * glfetch=0 the home screen's widgets and dock are drawn. Without the
- * extension "vcm" reads what is behind from a copy of the framebuffer made just before the draw
+ * Galaxy S7 port: with boot-arg glfetch=0, which keeps EXT_shader_framebuffer_fetch from CoreAnimation,
+ * "vcm" reads what is behind from a copy of the framebuffer made just before the draw
  * (unit 7, `origin` its corner in the framebuffer), the same arithmetic as vibrant_fragment.
  */
 #define BACKDROP_UNIT   7
