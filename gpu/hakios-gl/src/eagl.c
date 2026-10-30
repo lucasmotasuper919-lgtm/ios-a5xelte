@@ -231,6 +231,7 @@ struct image {
 	GLuint mirror;                  /* a texture that is the surface's memory, which the GPU copies the frame into (blit_targets) */
 	bool wrapped;                   /* the surface is memory of somebody's with a surface made around it */
 	bool alpha_first;               /* its pixels are opacity, blue, green, red in memory: see my_attachImage() */
+	bool deep;                      /* (Galaxy S7 port) a 'b3a8' surface drawn into: see deep_to_bgra() */
 	bool painted;                   /* something has been drawn into it (it is a target in fact, not only in name) */
 	unsigned looked;                /* ... the frame in which that memory was last looked at, */
 	uint64_t sum;                   /* ... and what it added up to */
@@ -671,10 +672,90 @@ surface_changed(struct eagl *e, struct image *image)
 	return true;
 }
 
+/*
+ * Galaxy S7 port: 'b3a8' (kCVPixelFormatType_30RGBLE_8A_BiPlanar), the surfaces iOS makes for an iPhone X's
+ * wide-colour display: plane 0 is 32 bits a pixel, blue in bits 0-9, green 10-19, red 20-29, on the extended
+ * scale where 384 is 0.0 and 894 is 1.0; plane 1 is opacity, 8 bits a pixel. Backboardd and SpringBoard draw
+ * the home screen, the dock and their caches into such surfaces; refused, the texture had no storage, the
+ * framebuffer was incomplete and every draw into it failed (GL_INVALID_FRAMEBUFFER_OPERATION): no icons, no
+ * wallpaper. Here the texture is an ordinary blue-first one, filled from and read back into the two planes.
+ */
+static uint8_t
+deep_channel(uint32_t code)
+{
+	int v = ((int)code - 384) * 255 / 510;
+
+	return (uint8_t)(v < 0 ? 0 : v > 255 ? 255 : v);
+}
+
+static void
+deep_to_bgra(IOSurfaceRef surface, uint8_t *out, GLsizei width, GLsizei height, bool invert)
+{
+	const uint8_t *colour = IOSurfaceGetBaseAddressOfPlane(surface, 0), *opacity = IOSurfaceGetBaseAddressOfPlane(surface, 1);
+	size_t crow = IOSurfaceGetBytesPerRowOfPlane(surface, 0), arow = IOSurfaceGetBytesPerRowOfPlane(surface, 1);
+
+	for (GLsizei y = 0; y < height; y++) {
+		size_t from = (size_t)(invert ? height - 1 - y : y);
+		const uint32_t *c = (const uint32_t *)(colour + crow * from);
+		const uint8_t *a = opacity + arow * from;
+		uint8_t *to = out + (size_t)y * (size_t)width * 4;
+
+		for (GLsizei x = 0; x < width; x++) {
+			to[x * 4] = deep_channel(c[x] & 0x3ff);
+			to[x * 4 + 1] = deep_channel((c[x] >> 10) & 0x3ff);
+			to[x * 4 + 2] = deep_channel((c[x] >> 20) & 0x3ff);
+			to[x * 4 + 3] = a[x];
+		}
+	}
+}
+
+static void
+bgra_to_deep(const uint8_t *in, IOSurfaceRef surface, GLsizei width, GLsizei height, bool invert)
+{
+	uint8_t *colour = IOSurfaceGetBaseAddressOfPlane(surface, 0), *opacity = IOSurfaceGetBaseAddressOfPlane(surface, 1);
+	size_t crow = IOSurfaceGetBytesPerRowOfPlane(surface, 0), arow = IOSurfaceGetBytesPerRowOfPlane(surface, 1);
+
+	for (GLsizei y = 0; y < height; y++) {
+		size_t to_row = (size_t)(invert ? height - 1 - y : y);
+		uint32_t *c = (uint32_t *)(colour + crow * to_row);
+		uint8_t *a = opacity + arow * to_row;
+		const uint8_t *from = in + (size_t)y * (size_t)width * 4;
+
+		for (GLsizei x = 0; x < width; x++) {
+			c[x] = (384u + from[x * 4] * 510u / 255u) | (384u + from[x * 4 + 1] * 510u / 255u) << 10 |
+			    (384u + from[x * 4 + 2] * 510u / 255u) << 20;
+			a[x] = from[x * 4 + 3];
+		}
+	}
+}
+
 /* Fill a texture, which is bound, from its IOSurface, unless it is the surface. */
 static void
 surface_to_texture(struct eagl *e, struct image *image)
 {
+	if (image->deep) {              /* (Galaxy S7 port) */
+		uint8_t *pixels = malloc((size_t)image->width * (size_t)image->height * 4);
+
+		if (pixels != NULL && IOSurfaceLock(image->surface, kIOSurfaceLockReadOnly, NULL) == 0) {
+			GLint alignment = 4, row_length = 0;
+
+			deep_to_bgra(image->surface, pixels, image->width, image->height, image->invert);
+			IOSurfaceUnlock(image->surface, kIOSurfaceLockReadOnly, NULL);
+			glGetIntegerv(GL_UNPACK_ROW_LENGTH, &row_length);
+			glGetIntegerv(GL_UNPACK_ALIGNMENT, &alignment);
+			glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
+			glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+			glTexImage2D(GL_TEXTURE_2D, 0, (GLint)internal_format(GL_BGRA, GL_BGRA), image->width, image->height, 0, GL_BGRA,
+			    GL_UNSIGNED_BYTE, pixels);
+			glPixelStorei(GL_UNPACK_ROW_LENGTH, row_length);
+			glPixelStorei(GL_UNPACK_ALIGNMENT, alignment);
+			image->seed = IOSurfaceGetSeed(image->surface);
+			e->uploads++;
+			e->upload_bytes += (size_t)image->width * (size_t)image->height * 5;
+		}
+		free(pixels);
+		return;
+	}
 	IOSurfaceRef surface = image->surface;
 	bool planar = IOSurfaceGetPlaneCount(surface) > 0;
 	size_t row = planar ? IOSurfaceGetBytesPerRowOfPlane(surface, image->plane) : IOSurfaceGetBytesPerRow(surface);
@@ -797,6 +878,22 @@ target_to_surface(struct eagl *e, struct image *image)
 	}
 	glBindFramebuffer(GL_FRAMEBUFFER, e->reader);
 	glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, image->texture, 0);
+	if (image->deep) {              /* (Galaxy S7 port) read back blue-first, then into the two planes */
+		uint8_t *pixels = malloc((size_t)image->width * (size_t)image->height * 4);
+
+		if (pixels != NULL) {
+			glPixelStorei(GL_PACK_ROW_LENGTH, 0);
+			glPixelStorei(GL_PACK_ALIGNMENT, 4);
+			glReadPixels(0, 0, image->width, image->height, GL_BGRA, GL_UNSIGNED_BYTE, pixels);
+			if (IOSurfaceLock(surface, 0, NULL) == 0) {
+				bgra_to_deep(pixels, surface, image->width, image->height, image->invert);
+				IOSurfaceUnlock(surface, 0, NULL);
+			}
+			free(pixels);
+		}
+		glBindFramebuffer(GL_FRAMEBUFFER, e->framebuffer);
+		return;
+	}
 	if (IOSurfaceLock(surface, 0, NULL) == 0) {
 		base = IOSurfaceGetBaseAddress(surface);
 		glPixelStorei(GL_PACK_ROW_LENGTH, (GLint)(row / 4));
@@ -3960,8 +4057,10 @@ my_attachImage(id self, SEL selector, unsigned long target, IOSurfaceRef surface
 	clear_now(e);
 	glGetIntegerv(GL_TEXTURE_BINDING_2D, &texture);
 	pixels = IOSurfaceGetPixelFormat(surface);
-	if (target != GL_TEXTURE_2D || texture == 0 || (pixels != 'BGRA' && pixels != 0) ||
-	    IOSurfaceGetBytesPerElement(surface) != 4 || IOSurfaceGetPlaneCount(surface) != 0 ||
+	/* (Galaxy S7 port: and 'b3a8', see deep_to_bgra()) */
+	bool deep = pixels == 'b3a8' && IOSurfaceGetPlaneCount(surface) == 2;
+	if (target != GL_TEXTURE_2D || texture == 0 || (pixels != 'BGRA' && pixels != 0 && !deep) ||
+	    (!deep && (IOSurfaceGetBytesPerElement(surface) != 4 || IOSurfaceGetPlaneCount(surface) != 0)) ||
 	    (image = image_new(e, (GLuint)texture, surface)) == NULL) {
 		say("hakios-gl: -attachImage: target %#lx, texture %d, an IOSurface of '%.4s': not done\n", target, texture,
 		    (const char *)&(uint32_t){ __builtin_bswap32(pixels) });
@@ -3986,7 +4085,9 @@ my_attachImage(id self, SEL selector, unsigned long target, IOSurfaceRef surface
 	 * there being no pixel format.
 	 */
 	image->wrapped = image->alpha_first = pixels == 0;
-	note_format("IOSurface attached", GL_BGRA, GL_BGRA, GL_UNSIGNED_BYTE, image->width, image->height);
+	image->deep = deep;
+	note_format(deep ? "IOSurface attached, b3a8" : "IOSurface attached", GL_BGRA, GL_BGRA, GL_UNSIGNED_BYTE, image->width,
+	    image->height);
 	/*
 	 * What is attached is as often read as drawn into (a picture CoreAnimation has made a surface
 	 * around, to be shown): a texture that is not the surface's memory starts with what the surface holds.
