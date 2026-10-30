@@ -20,6 +20,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/sysctl.h>
 #include <unistd.h>
 
 extern const void *_dyld_get_shared_cache_range(size_t *length);
@@ -78,6 +79,50 @@ replace_virtual(const char *what, uintptr_t slot, uintptr_t expected, void *repl
 	return original;
 }
 
+/*
+ * Boot-arg glsb3=1: CoreAnimation's function 40 ("sb3", the four samples of a small shadow blur), for which
+ * the renderer has no shader, is given one in its table of sources (HakiOS: inject.c, shadow_blur_source;
+ * ds4's shader without the weights) and function_supported() says yes for it. Without it, what needs the
+ * function is not drawn.
+ */
+#define CA_SHADER_TABLE         0x1d5b48a10UL   /* indexed by function (16.5: 0x1d5b54790) */
+#define FUNCTION_SHADOW_BLUR    40
+
+static const char shadow_blur_source[] =
+    "uniform lowp sampler2DRect texture0;\n"
+    "varying highp vec2 texcoord0, texcoord1, texcoord2, texcoord3;\n"
+    "void main () {\n"
+    "  lowp vec4 q0, q1, q2, q3;\n"
+    "  q0 = texture2DRect(texture0, texcoord0);\n"
+    "  q1 = texture2DRect(texture0, texcoord1);\n"
+    "  q2 = texture2DRect(texture0, texcoord2);\n"
+    "  q3 = texture2DRect(texture0, texcoord3);\n"
+    "  gl_FragData[0] = (q0 + q1 + q2 + q3) * 0.25;\n"
+    "}\n";
+
+static int shadow_blur_given;
+
+static void
+give_shadow_blur(void)
+{
+	uintptr_t *entry = (uintptr_t *)(CA_SHADER_TABLE + slide + 8 * (uintptr_t)FUNCTION_SHADOW_BLUR);
+	vm_address_t page = (vm_address_t)entry & ~(vm_address_t)(vm_page_size - 1);
+
+	/* ds4 (26) must be where it was found: the table is the one this cache has */
+	if (*(uintptr_t *)(CA_SHADER_TABLE + slide + 8 * 26) == 0 || *entry != 0) {
+		say("hakios-ca: the shader table is not as expected; sb3 left alone\n");
+		return;
+	}
+	if (vm_protect(mach_task_self(), page, vm_page_size, FALSE, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY) != KERN_SUCCESS) {
+		say("hakios-ca: cannot make the table of shaders writable\n");
+		return;
+	}
+	*entry = (uintptr_t)shadow_blur_source;
+	vm_protect(mach_task_self(), page, vm_page_size, FALSE, VM_PROT_READ);
+	shadow_blur_given = 1;
+	say("hakios-ca: CoreAnimation's function 40 (\"sb3\") is given a shader of ours\n");
+}
+
 static int (*orig_function_supported)(void *context);
 static void (*orig_function_uniform)(void *context, unsigned index, size_t components, size_t count, const float *values);
 
@@ -88,6 +133,9 @@ my_function_supported(void *context)
 	int supported = orig_function_supported(context);
 	uint8_t function = *(*(uint8_t **)((char *)context + 0x10) + 0x10);
 
+	if (!supported && function == FUNCTION_SHADOW_BLUR && shadow_blur_given) {
+		return 1;
+	}
 	if (!supported) {
 		hakios_gl_function_refused(function);
 		if (!said[function]) {
@@ -117,6 +165,14 @@ hakios_ca_hooks(void)
 		return;
 	}
 	slide = (uintptr_t)cache - CACHE_BASE;
+	{
+		char arguments[1024] = "";
+		size_t size = sizeof(arguments) - 1;
+
+		if (sysctlbyname("kern.bootargs", arguments, &size, NULL, 0) == 0 && strstr(arguments, "glsb3=1") != NULL) {
+			give_shadow_blur();
+		}
+	}
 	orig_function_supported = replace_virtual("function_supported", VSLOT(VT_GLES_CONTEXT, 0x378), FUNCTION_SUPPORTED,
 	    my_function_supported);
 	orig_function_uniform = replace_virtual("function_uniform", VSLOT(VT_GLES_CONTEXT, 0x388), FUNCTION_UNIFORM,

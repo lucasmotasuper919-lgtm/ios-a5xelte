@@ -378,6 +378,9 @@ static int fetch_offered = 1;
 
 #define GL_SCISSOR_TEST                 0x0c11
 #define GL_SCISSOR_BOX                  0x0c10
+#ifndef GL_VIEWPORT
+#define GL_VIEWPORT                     0x0ba2
+#endif
 #define GL_COLOR_CLEAR_VALUE            0x0c22
 
 static const char *eagl_slot_name(unsigned offset);
@@ -804,6 +807,30 @@ surface_to_texture(struct eagl *e, struct image *image)
 	    image->format, image->type, base);
 	glPixelStorei(GL_UNPACK_ROW_LENGTH, row_length);
 	glPixelStorei(GL_UNPACK_ALIGNMENT, alignment);
+	if (!image->target && image->width == image->height && image->width >= 100 && image->width <= 200) {
+		/* (Galaxy S7 port) an icon's picture: is there anything in it when it becomes a texture? */
+		static unsigned told;
+
+		if (told++ < 40) {
+			size_t lit = 0, opaque = 0;
+
+			for (GLsizei y = 0; y < image->height; y++) {
+				const uint8_t *p = base + row * (size_t)y;
+
+				for (GLsizei x = 0; x < image->width; x++, p += pixel) {
+					lit += (p[0] | p[1] | p[2]) != 0;
+					opaque += pixel == 4 && p[3] != 0;
+				}
+			}
+			say("hakios-gl: icon: texture %u filled from surface %u (seed %u, format %#x/%#x, %zu bytes a row): %zu of %d pixels "
+			    "lit, %zu not clear; the middle %02x %02x %02x %02x\n", image->texture, IOSurfaceGetID(surface),
+			    IOSurfaceGetSeed(surface), image->format, image->type, row, lit, image->width * image->height, opaque,
+			    base[row * (size_t)(image->height / 2) + (size_t)(image->width / 2) * pixel],
+			    base[row * (size_t)(image->height / 2) + (size_t)(image->width / 2) * pixel + 1],
+			    base[row * (size_t)(image->height / 2) + (size_t)(image->width / 2) * pixel + 2],
+			    base[row * (size_t)(image->height / 2) + (size_t)(image->width / 2) * pixel + 3]);
+		}
+	}
 	if (trace_placing) {
 		size_t set[4] = { 0, 0, 0, 0 }, size = row * (size_t)(image->height - 1) + (size_t)image->width * pixel;
 
@@ -1281,6 +1308,24 @@ drawing(struct eagl *e)
 	struct image *image;
 
 	frame_begin(e);
+	if (e->bound[0] != 0 && (image = image_of(e, e->bound[0])) != NULL && !image->target && image->width == image->height &&
+	    image->width >= 100 && image->width <= 200) {
+		/* (Galaxy S7 port) an icon's picture is drawn: into what, and how */
+		static unsigned told;
+		struct image *into = e->colour != 0 ? image_of(e, e->colour) : NULL;
+		GLint viewport[4] = { 0, 0, 0, 0 }, scissor[4] = { 0, 0, 0, 0 };
+
+		if (told++ < 40) {
+			glGetIntegerv(GL_VIEWPORT, viewport);
+			glGetIntegerv(GL_SCISSOR_BOX, scissor);
+			say("hakios-gl: icon: texture %u (surface %u) drawn by program %u into framebuffer %u (texture %u%s%s, %d x %d), "
+			    "viewport %d,%d %dx%d, scissor %s %d,%d %dx%d, blend %s, frame %u\n", e->bound[0], IOSurfaceGetID(image->surface),
+			    e->program, e->framebuffer, e->colour, into != NULL ? ", surface " : "", into != NULL ? (into->target ? "target" :
+			    "shown") : "", into != NULL ? into->width : 0, into != NULL ? into->height : 0, viewport[0], viewport[1], viewport[2],
+			    viewport[3], glIsEnabled(GL_SCISSOR_TEST) ? "on" : "off", scissor[0], scissor[1], scissor[2], scissor[3],
+			    glIsEnabled(GL_BLEND) ? "on" : "off", e->frames + 1);
+		}
+	}
 	if (e->framebuffer != 0 && e->colour != 0 && (image = image_of(e, e->colour)) != NULL && image->target) {
 		image->drawn = image->painted = true;
 		if (frame_lines && image->width >= 1000 && image->height >= 2000) {
