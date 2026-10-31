@@ -7,6 +7,7 @@
  * after 180 s.
  */
 #include <dirent.h>
+#include <sys/stat.h>
 #include <dlfcn.h>
 #include <fcntl.h>
 #include <objc/message.h>
@@ -178,104 +179,7 @@ plugins_census(id workspace)
    }
 }
 
-/*
- * iOS's own log says why PosterBoard shows nothing and why the widgets wait, and TWRP cannot read it. As root, late
- * in the boot, the lines of those processes (and any on the subject) go into the census.
- */
-static void
-log_census_exception(id exception)
-{
-   dprintf(census_fd, "log reader: exception %s\n", text_of(exception));
-   _exit(0);
-}
-
-static void
-log_census(void)
-{
-   enum { MAX_LOG_LINES = 250, MAX_SECONDS = 90 };
-   alarm(280);
-   sleep(170);
-   NSSetUncaughtExceptionHandler(log_census_exception);
-   dlopen("/System/Library/Frameworks/OSLog.framework/OSLog", RTLD_NOW);
-   Class stores = objc_getClass("OSLogStore");
-   id error = nil;
-   id store = stores ? send_id((id)stores, "localStoreAndReturnError:", (id)&error, NULL) : nil;
-   dprintf(census_fd, "log store %s; error %s\n", text_of(store), text_of(error));
-   id entries = store ? send_id(store, "entriesEnumeratorAndReturnError:", (id)&error, NULL) : nil;
-   time_t start = time(NULL);
-   int lines = 0;
-   id entry;
-   SEL has = sel_registerName("respondsToSelector:");
-   while (entries && lines < MAX_LOG_LINES && time(NULL) - start < MAX_SECONDS) {
-      void *pool = objc_autoreleasePoolPush();
-      entry = send0(entries, "nextObject");
-      if (!entry) {
-         objc_autoreleasePoolPop(pool);
-         break;
-      }
-      if (((BOOL (*)(id, SEL, SEL))objc_msgSend)(entry, has, sel_registerName("process"))) {
-         const char *process = text_of(send0(entry, "process"));
-         const char *message = text_of(send0(entry, "composedMessage"));
-         int wanted = strcmp(process, "PosterBoard") == 0 || strcmp(process, "chronod") == 0;
-         int subject = strstr(message, "oster") || strstr(message, "idget") || strstr(message, "xtension");
-         int failing = strstr(message, "rror") || strstr(message, "ail") || strstr(message, "denied") || strstr(message, "not ");
-         if ((wanted && failing) || (subject && failing)) {
-            dprintf(census_fd, "log %s: %.240s\n", process, message);
-            lines++;
-         }
-      }
-      objc_autoreleasePoolPop(pool);
-   }
-   dprintf(census_fd, "log: %d lines, %ld s; error %s\n", lines, (long)(time(NULL) - start), text_of(error));
-}
-
-/*
- * LaunchServices answers -10814 (not found) for the poster extensions: the plug-ins inside the system's frameworks
- * are not registered, and PosterBoard has nothing to offer or to draw. On a phone that comes with DataMigration,
- * which this image skips. Each one is registered by its URL, once; the wallpaper needs the next boot to see them.
- */
-static int
-register_plugins_in(id workspace, const char *frameworks)
-{
-   int done = 0;
-   DIR *all = opendir(frameworks);
-   struct dirent *f, *p;
-   while (all && (f = readdir(all))) {
-      char dir[1024];
-      snprintf(dir, sizeof(dir), "%s/%s/PlugIns", frameworks, f->d_name);
-      DIR *plugins = opendir(dir);
-      while (plugins && (p = readdir(plugins))) {
-         char path[2048];
-         size_t n = strlen(p->d_name);
-         if (n < 6 || strcmp(p->d_name + n - 6, ".appex") != 0)
-            continue;
-         snprintf(path, sizeof(path), "%s/%s", dir, p->d_name);
-         void *pool = objc_autoreleasePoolPush();
-         id url = ((id (*)(id, SEL, id))objc_msgSend)((id)objc_getClass("NSURL"), sel_registerName("fileURLWithPath:"),
-            nsstring(path));
-         BOOL ok = ((BOOL (*)(id, SEL, id))objc_msgSend)(workspace, sel_registerName("registerPlugin:"), url);
-         done += ok;
-         if (!ok || strstr(p->d_name, "Poster"))
-            dprintf(census_fd, "register %s: %d\n", p->d_name, ok);
-         objc_autoreleasePoolPop(pool);
-      }
-      if (plugins)
-         closedir(plugins);
-   }
-   if (all)
-      closedir(all);
-   return done;
-}
-
-static void
-register_system_plugins(id workspace)
-{
-   int done = register_plugins_in(workspace, "/System/Library/PrivateFrameworks") +
-      register_plugins_in(workspace, "/System/Library/Frameworks");
-   dprintf(census_fd, "plug-ins registered: %d\n", done);
-   BOOL synced = ((BOOL (*)(id, SEL))objc_msgSend)(workspace, sel_registerName("_LSPrivateSyncWithMobileInstallation"));
-   dprintf(census_fd, "sync with installd: %d\n", synced);
-}
+static void run_ls_migrator(void);
 
 static void
 extension_census(void)
@@ -285,16 +189,13 @@ extension_census(void)
       "com.apple.GradientPoster.GradientPosterExtension",
       "com.apple.PhotosUIPrivate.PhotosPosterProvider",
    };
-   pid_t reader = fork();
-   if (reader == 0) {
-      log_census();
-      _exit(0);
-   }
    /* LaunchServices is told once of the system's bundles: DataMigration, which does it on a real phone, is skipped
     * on this image (herolte-tune-ios-root.sh). The parent marks it done when this child has lived through it. */
    int first_time = access(DROP_DIR "database.done", F_OK) != 0;
-   alarm(300);
+   alarm(0);
    sleep(60);
+   run_ls_migrator();
+   alarm(300);
    if (setgid(501) != 0 || setuid(501) != 0)
       dprintf(census_fd, "cannot become mobile\n");
    dlopen("/System/Library/Frameworks/CoreServices.framework/CoreServices", RTLD_NOW);
@@ -306,8 +207,6 @@ extension_census(void)
          sel_registerName("_LSPrivateRebuildApplicationDatabasesForSystemApps:internal:user:"), YES, YES, YES);
       dprintf(census_fd, "database rebuilt: %d\n", rebuilt);
    }
-   if (workspace && access(DROP_DIR "plugins.done", F_OK) != 0)
-      register_system_plugins(workspace);
    Class records = objc_getClass("LSApplicationExtensionRecord");
    for (size_t i = 0; records && i < sizeof(known) / sizeof(known[0]); i++) {
       id error = nil;
@@ -323,8 +222,6 @@ extension_census(void)
    dprintf(census_fd, "of the poster point: %s; error %s\n", text_of(found), text_of(error));
    if (workspace)
       plugins_census(workspace);
-   if (reader > 0)
-      waitpid(reader, NULL, 0);
 }
 
 /* The complete lines the child has written since the last call go to the log. */
@@ -346,10 +243,147 @@ census_drain(void)
    }
 }
 
+/*
+ * The whole of DataMigration does not finish here: datamigrator waits on its plug-in wrapper, for good. So its plist
+ * stays as the image has it (put back first thing, before launchd gets to the migration), and of its plug-ins only
+ * the one that tells LaunchServices about the system runs, once, in this process.
+ */
+#define MIGRATION_PLIST "/private/var/mobile/Library/Preferences/com.apple.migration.plist"
+#define MIGRATION_SAVED DROP_DIR "migration.saved"
+#define LS_MIGRATOR     "/System/Library/DataClassMigrators/00LaunchServicesMigrator.migrator"
+#define LS_MIGRATED     DROP_DIR "lsmigrator2.done"
+#define LS_ANSWER       DROP_DIR "lsmigrator.log"
+
+static void
+migration_restore(void)
+{
+   if (access(MIGRATION_SAVED, F_OK) == 0)
+      herodrm_log("hero-run: migration: plist put back (%d)", rename(MIGRATION_SAVED, MIGRATION_PLIST));
+   herodrm_log("hero-run: migration: plist %s", access(MIGRATION_PLIST, F_OK) == 0 ? "present" : "MISSING");
+}
+
+/*
+ * The services heronoexec refuses are relaunched by launchd every ten seconds for ever, and each try costs a good
+ * part of a CPU (kernel_task and xpcproxy at 100% and more). launchd's own list of disabled jobs stops that from the
+ * next boot on. DROP_DIR disabled.list, one job a line, adds to them with no new build: 41 at once left SpringBoard
+ * waiting for ever behind a black screen, so which ones are safe is found by trying.
+ */
+static void
+disable_refused_jobs(void)
+{
+   static const char *const jobs[] = {
+      "com.apple.bluetoothd", "com.apple.ReportCrash", "com.apple.analyticsd", "com.apple.aggregated",
+      "com.apple.homed", "com.apple.cloudd", "com.apple.searchd", "com.apple.voicemail.vmd",
+   };
+   size_t count = sizeof(jobs) / sizeof(jobs[0]);
+   mkdir("/private/var/db/com.apple.xpc.launchd", 0755);
+   FILE *f = fopen("/private/var/db/com.apple.xpc.launchd/disabled.plist", "w");
+   if (!f) {
+      herodrm_log("hero-run: cannot write launchd's disabled jobs");
+      return;
+   }
+   fputs("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<plist version=\"1.0\">\n<dict>\n", f);
+   for (size_t i = 0; i < count; i++)
+      fprintf(f, "\t<key>%s</key>\n\t<true/>\n", jobs[i]);
+   FILE *extra = fopen(DROP_DIR "disabled.list", "r");
+   char job[256];
+   while (extra && fgets(job, sizeof(job), extra)) {
+      job[strcspn(job, " \t\r\n")] = 0;
+      if (job[0] && job[0] != '#') {
+         fprintf(f, "\t<key>%s</key>\n\t<true/>\n", job);
+         count++;
+      }
+   }
+   if (extra)
+      fclose(extra);
+   fputs("</dict>\n</plist>\n", f);
+   fclose(f);
+   herodrm_log("hero-run: %zu jobs in launchd's disabled list", count);
+}
+
+/* In the census child, as root, before it becomes mobile. */
+static void
+run_ls_migrator(void)
+{
+   char said[1024];
+   int old = open(LS_ANSWER, O_RDONLY);
+   ssize_t got = old >= 0 ? read(old, said, sizeof(said) - 1) : 0;
+   if (old >= 0)
+      close(old);
+   if (got > 0) {
+      said[got] = 0;
+      dprintf(census_fd, "LS migrator, last time:\n%s", said);
+   }
+   if (access(LS_MIGRATED, F_OK) == 0)
+      return;
+   close(open(LS_MIGRATED, O_WRONLY | O_CREAT, 0644));
+   int answer = open(LS_ANSWER, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+   id bundle = ((id (*)(id, SEL, id))objc_msgSend)((id)objc_getClass("NSBundle"), sel_registerName("bundleWithPath:"),
+      nsstring(LS_MIGRATOR));
+   BOOL loaded = bundle ? ((BOOL (*)(id, SEL))objc_msgSend)(bundle, sel_registerName("load")) : NO;
+   id cls = bundle ? send0(bundle, "principalClass") : nil;
+   dprintf(census_fd, "LS migrator: bundle %s, loaded %d, class %s\n", text_of(bundle), loaded, text_of(cls));
+   dprintf(answer, "LS migrator: bundle %s, loaded %d, class %s\n", text_of(bundle), loaded, text_of(cls));
+   if (!cls)
+      return;
+   id migrator = send0(send0(cls, "alloc"), "init");
+   time_t start = time(NULL);
+   BOOL done = ((BOOL (*)(id, SEL))objc_msgSend)(migrator, sel_registerName("performMigration"));
+   dprintf(census_fd, "LS migrator: performMigration %d, %ld s\n", done, (long)(time(NULL) - start));
+   dprintf(answer, "LS migrator: performMigration %d, %ld s\n", done, (long)(time(NULL) - start));
+}
+
+/*
+ * LaunchServices builds its database by walking the system when it finds none: HakiOS has an empty /private/var at
+ * every boot and its posters are there. Ours keeps the first one, which has none of them. Once, it goes: the next
+ * start of lsd makes it anew. Nothing says where it lives on this root, so all of /private/var is looked through.
+ */
+#define LS_DB_GONE DROP_DIR "lsdb2.gone"
+
+static int
+remove_ls_db_in(const char *dir, int depth)
+{
+   int removed = 0;
+   DIR *d = opendir(dir);
+   struct dirent *e;
+   while (d && (e = readdir(d))) {
+      char path[1024];
+      struct stat st;
+      if (e->d_name[0] == '.' && (e->d_name[1] == 0 || e->d_name[1] == '.'))
+         continue;
+      snprintf(path, sizeof(path), "%s/%s", dir, e->d_name);
+      if (strstr(e->d_name, ".csstore")) {
+         int gone = unlink(path);
+         herodrm_log("hero-run: LS database %s: removed (%d)", path, gone);
+         removed += gone == 0;
+      } else if (depth > 0 && strcmp(path, "/private/var/herolte") && lstat(path, &st) == 0 && S_ISDIR(st.st_mode)) {
+         removed += remove_ls_db_in(path, depth - 1);
+      }
+   }
+   if (d)
+      closedir(d);
+   return removed;
+}
+
+static void
+remove_ls_db_once(void)
+{
+   if (access(LS_DB_GONE, F_OK) == 0)
+      return;
+   close(open(LS_DB_GONE, O_WRONLY | O_CREAT, 0644));
+   time_t start = time(NULL);
+   int removed = remove_ls_db_in("/private/var", 9);
+   herodrm_log("hero-run: LS database: %d files removed in %ld s; the NEXT boot has it made anew", removed,
+      (long)(time(NULL) - start));
+}
+
 int
 main(void)
 {
+   remove_ls_db_once();
    wallpapers_for_this_screen();
+   migration_restore();
+   disable_refused_jobs();
    census_fd = open(DROP_DIR "census.out", O_RDWR | O_CREAT | O_TRUNC, 0644);
    pid_t census = fork();
    if (census == 0) {
@@ -417,7 +451,6 @@ main(void)
       herodrm_log("hero-run: extensions: the child ended with status %#x", census_status);
       if (WIFEXITED(census_status) && WEXITSTATUS(census_status) == 0) {
          close(open(DROP_DIR "database.done", O_WRONLY | O_CREAT, 0644));
-         close(open(DROP_DIR "plugins.done", O_WRONLY | O_CREAT, 0644));
       }
    }
    return 0;
