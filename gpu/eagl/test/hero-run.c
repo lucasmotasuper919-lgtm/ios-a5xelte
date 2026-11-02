@@ -6,6 +6,7 @@
  * herodrm_log), since TWRP cannot read the iOS volume. The test is killed
  * after 180 s.
  */
+#include <CoreFoundation/CoreFoundation.h>
 #include <dirent.h>
 #include <sys/stat.h>
 #include <dlfcn.h>
@@ -179,8 +180,60 @@ plugins_census(id workspace)
    }
 }
 
-static void run_ls_migrator(void);
+/*
+ * LaunchServices never hears of the poster extensions, which live inside frameworks: it is told of each by hand, once,
+ * as root. And a wallpaper of the old kind asked of SpringBoard, which needs no poster at all.
+ */
+#define POSTERS_TOLD DROP_DIR "posters3.done"
 
+static void
+tell_ls_of_posters(void)
+{
+   static const char *const appex[] = {
+      "/System/Library/PrivateFrameworks/WallpaperKit.framework/PlugIns/CollectionsPoster.appex",
+      "/System/Library/PrivateFrameworks/GradientPoster.framework/PlugIns/GradientPosterExtension.appex",
+      "/System/Library/PrivateFrameworks/PhotosUIPrivate.framework/PlugIns/PhotosPosterProvider.appex",
+      "/System/Library/PrivateFrameworks/EmojiPoster.framework/PlugIns/EmojiPosterExtension.appex",
+      "/System/Library/PrivateFrameworks/UnityPoster.framework/PlugIns/UnityPosterExtension.appex",
+      "/System/Library/PrivateFrameworks/PridePoster.framework/PlugIns/PridePosterExtension.appex",
+      "/Applications/Weather.app/PlugIns/WeatherPoster.appex",
+   };
+   if (access(POSTERS_TOLD, F_OK) == 0)
+      return;
+   close(open(POSTERS_TOLD, O_WRONLY | O_CREAT, 0644));
+   int (*lsregister)(id, unsigned char) = (int (*)(id, unsigned char))dlsym(RTLD_DEFAULT, "LSRegisterURL");
+   if (!lsregister) {
+      dprintf(census_fd, "LSRegisterURL: not there\n");
+      return;
+   }
+   for (size_t i = 0; i < sizeof(appex) / sizeof(appex[0]); i++) {
+      id url = send_id((id)objc_getClass("NSURL"), "fileURLWithPath:", nsstring(appex[i]), NULL);
+      time_t start = time(NULL);
+      int status = lsregister(url, 1);
+      dprintf(census_fd, "LSRegisterURL %s: %d, %ld s\n", appex[i], status, (long)(time(NULL) - start));
+   }
+}
+
+static void
+ask_for_old_wallpaper(void)
+{
+   static const char *const image_path =
+      "/Library/Wallpaper/Collections/Clownfish~iphone.wallpaperCollection/Wallpapers/"
+      "7420.Clownfish-375w-812h@3x~iphone.wallpaper/7420.Clownfish_Background-375w-812h@3x~iphone.ca/assets/Background.HEIC";
+   dlopen("/System/Library/Frameworks/UIKit.framework/UIKit", RTLD_NOW);
+   dlopen("/System/Library/PrivateFrameworks/SpringBoardUIServices.framework/SpringBoardUIServices", RTLD_NOW);
+   int (*set_images)(id, id, int, int) = (int (*)(id, id, int, int))dlsym(RTLD_DEFAULT, "SBSUIWallpaperSetImages");
+   id image = objc_getClass("UIImage") ? send_id((id)objc_getClass("UIImage"), "imageWithContentsOfFile:", nsstring(image_path), NULL) : nil;
+   dprintf(census_fd, "old wallpaper: function %d, image %s\n", set_images != NULL, text_of(image));
+   if (!set_images || !image)
+      return;
+   id images = ((id (*)(id, SEL, id, id))objc_msgSend)((id)objc_getClass("NSDictionary"),
+      sel_registerName("dictionaryWithObject:forKey:"), image, nsstring("light"));
+   id options = send0((id)objc_getClass("NSDictionary"), "dictionary");
+   dprintf(census_fd, "old wallpaper: asked, answer %d\n", set_images(images, options, 3, 0));
+}
+
+static void run_ls_migrator(void);
 static void
 extension_census(void)
 {
@@ -190,12 +243,15 @@ extension_census(void)
       "com.apple.PhotosUIPrivate.PhotosPosterProvider",
    };
    /* LaunchServices is told once of the system's bundles: DataMigration, which does it on a real phone, is skipped
-    * on this image (herolte-tune-ios-root.sh). The parent marks it done when this child has lived through it. */
-   int first_time = access(DROP_DIR "database.done", F_OK) != 0;
+    * on this image (herolte-tune-ios-root.sh). The parent marks it done when this child has lived through it.
+    * Done again since the kernel answers AMFI's request 0x60: only now does LaunchServices know the extension points. */
+   int first_time = access(DROP_DIR "database2.done", F_OK) != 0;
    alarm(0);
    sleep(60);
    run_ls_migrator();
    alarm(300);
+   dlopen("/System/Library/Frameworks/CoreServices.framework/CoreServices", RTLD_NOW);
+   tell_ls_of_posters();
    if (setgid(501) != 0 || setuid(501) != 0)
       dprintf(census_fd, "cannot become mobile\n");
    dlopen("/System/Library/Frameworks/CoreServices.framework/CoreServices", RTLD_NOW);
@@ -222,6 +278,7 @@ extension_census(void)
    dprintf(census_fd, "of the poster point: %s; error %s\n", text_of(found), text_of(error));
    if (workspace)
       plugins_census(workspace);
+   ask_for_old_wallpaper();
 }
 
 /* The complete lines the child has written since the last call go to the log. */
@@ -377,9 +434,76 @@ remove_ls_db_once(void)
       (long)(time(NULL) - start));
 }
 
+/*
+ * BTAudioHALPlugin keeps asking the bluetoothd that heronoexec refuses, over XPC: on the S9 port that was most of
+ * launchd's and half of mediaserverd's CPU (idle 460% -> 52% without it). Out of the way, from the next boot on.
+ */
+static void
+disable_bluetooth_audio(void)
+{
+   const char *from = "/System/Library/Audio/Plug-Ins/HAL/BTAudioHALPlugin.driver";
+   if (access(from, F_OK) != 0)
+      return;
+   mkdir("/System/Library/Audio/Plug-Ins/HAL.disabled", 0755);
+   int moved = rename(from, "/System/Library/Audio/Plug-Ins/HAL.disabled/BTAudioHALPlugin.driver");
+   herodrm_log("hero-run: BTAudioHALPlugin moved away: %d", moved);
+}
+
+/*
+ * reduce.transparency in the drop zone: Settings' Reduce Transparency, whose Accessibility page crashes here (CoreImage,
+ * from MobileIcons). No blurs, the GPU's heaviest work; SpringBoard reads it at its next start, so from the next boot on.
+ */
+static void
+reduce_transparency(void)
+{
+   struct stat st;
+   if (stat("/private/var/herolte/reduce.transparency", &st) != 0)
+      return;
+   CFPreferencesSetValue(CFSTR("EnhancedBackgroundContrastEnabled"), kCFBooleanTrue, CFSTR("com.apple.Accessibility"),
+                         CFSTR("mobile"), kCFPreferencesAnyHost);
+   CFPreferencesSynchronize(CFSTR("com.apple.Accessibility"), CFSTR("mobile"), kCFPreferencesAnyHost);
+}
+
+/* The plug-in of the sound (gpu/hakios-audio) where mediaserverd looks: it loads plug-ins as it starts, so from the next boot on. */
+static void
+copy_audio_file(const char *from, const char *to, mode_t mode)
+{
+   char buffer[65536];
+   ssize_t n;
+   int in = open(from, O_RDONLY), out = in >= 0 ? open(to, O_WRONLY | O_CREAT | O_TRUNC, mode) : -1;
+   while (out >= 0 && (n = read(in, buffer, sizeof(buffer))) > 0) {
+      if (write(out, buffer, (size_t)n) != n)
+         break;
+   }
+   if (out >= 0) {
+      fchmod(out, mode);
+      close(out);
+   }
+   if (in >= 0)
+      close(in);
+   herodrm_log("hero-run: audio plug-in: %s: %s", to, out >= 0 ? "put" : "not put");
+}
+
+static void
+install_audio_plugin(void)
+{
+   struct stat from, to;
+   const char *driver = "/System/Library/Audio/Plug-Ins/HAL/HakiosAudio.driver/HakiosAudio";
+   int have = stat(DROP_DIR "audio/HakiosAudio", &from) == 0, there = stat(driver, &to) == 0;
+   herodrm_log("hero-run: audio plug-in: drop zone %lld bytes, HAL %lld bytes", have ? (long long)from.st_size : -1, there ? (long long)to.st_size : -1);
+   if (!have || (there && to.st_size == from.st_size && to.st_mtime >= from.st_mtime))
+      return;
+   mkdir("/System/Library/Audio/Plug-Ins/HAL/HakiosAudio.driver", 0755);
+   copy_audio_file(DROP_DIR "audio/HakiosAudio", driver, 0755);
+   copy_audio_file(DROP_DIR "audio/Info.plist", "/System/Library/Audio/Plug-Ins/HAL/HakiosAudio.driver/Info.plist", 0644);
+}
+
 int
 main(void)
 {
+   disable_bluetooth_audio();
+   install_audio_plugin();
+   reduce_transparency();
    remove_ls_db_once();
    wallpapers_for_this_screen();
    migration_restore();
@@ -450,7 +574,7 @@ main(void)
       census_drain();
       herodrm_log("hero-run: extensions: the child ended with status %#x", census_status);
       if (WIFEXITED(census_status) && WEXITSTATUS(census_status) == 0) {
-         close(open(DROP_DIR "database.done", O_WRONLY | O_CREAT, 0644));
+         close(open(DROP_DIR "database2.done", O_WRONLY | O_CREAT, 0644));
       }
    }
    return 0;
